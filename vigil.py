@@ -392,13 +392,14 @@ def resume_argv(claim, prompt):
                  "--permission-mode", policy.get("permission-mode", "default"),
                  prompt]
     else:
-        inner = [CODEX_BIN, "exec", "resume", claim["session"]]
+        # codex requires flags BEFORE the `resume` subcommand (verified live)
+        inner = [CODEX_BIN, "exec"]
         sandbox = policy.get("codex-sandbox")
         if sandbox in ("read-only", "workspace-write", "danger-full-access"):
             inner += ["--sandbox", sandbox]
         if policy.get("codex-bypass") == "true":
             inner += ["--dangerously-bypass-approvals-and-sandbox"]
-        inner += [prompt]
+        inner += ["resume", claim["session"], prompt]
     return [TMUX_BIN, "new-session", "-d", "-s", tmux_name, "-c", workdir,
             "--"] + inner
 
@@ -432,7 +433,7 @@ def build_prompt(claim, strikes):
         "your transcript. Recent incidents:\n%s\n"
         "Re-claim with: vigil claim %s --session <your-session-id> --vendor %s, "
         "then continue the work."
-        % (claim["entry"], strikes.get(claim["entry"], 0), MAX_STRIKES,
+        % (claim["entry"], strikes.get(claim["entry"], 0) + 1, MAX_STRIKES,
            "\n".join(tail[-2:]) or "(none)", claim["entry"], claim["vendor"])
     )
 

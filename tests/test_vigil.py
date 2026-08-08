@@ -85,6 +85,23 @@ class DecideTests(unittest.TestCase):
         self.assertEqual(r["recover"], "E1")  # sorted order, exactly one
 
 
+class ResumeArgvTests(unittest.TestCase):
+    def test_codex_flags_precede_resume_subcommand(self):
+        claim = {"entry": "E1", "session": "sid123", "vendor": "codex",
+                 "policy": {"codex-sandbox": "read-only"}, "workdir": "/tmp"}
+        argv = vigil.resume_argv(claim, "p")
+        i = argv.index("exec")
+        self.assertEqual(argv[i + 1: i + 4], ["--sandbox", "read-only", "resume"])
+        self.assertEqual(argv[-2], "sid123")
+
+    def test_claude_policy_not_elevated(self):
+        claim = {"entry": "E1", "session": "sid123", "vendor": "claude",
+                 "policy": {}, "workdir": "/tmp"}
+        argv = vigil.resume_argv(claim, "p")
+        self.assertIn("default", argv)
+        self.assertNotIn("bypassPermissions", argv)
+
+
 class LedgerParseTests(unittest.TestCase):
     HDR = "| id | date | request | lane | plan-ref | status | evidence |\n|--|--|--|--|--|--|--|\n"
 
