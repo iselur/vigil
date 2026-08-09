@@ -563,10 +563,40 @@ def cmd_check():
             recover(d["recover"], claim, strikes)
         write_json(STATE / "notified.json", d["notified"])
         (STATE / "last-check").write_text(now_iso())
+        maybe_heartbeat(d["states"])
         return 0
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+
+
+def maybe_heartbeat(states):
+    """Once a day, prove the quiet is deliberate: send an all-clear."""
+    hours = float(os.environ.get("VIGIL_HEARTBEAT_H", "24"))
+    if hours <= 0:
+        return
+    stamp = STATE / "last-heartbeat"
+    try:
+        if time.time() - stamp.stat().st_mtime < hours * 3600:
+            return
+    except OSError:
+        pass
+    if not states:
+        body = "Nothing is open in the watched ledgers right now."
+    else:
+        healthy = sorted(e for e, s in states.items() if s == "healthy")
+        other = sorted((e, s) for e, s in states.items() if s != "healthy")
+        parts = []
+        if healthy:
+            parts.append("%s healthy" % ", ".join(healthy))
+        parts += ["%s %s" % (e, s) for e, s in other]
+        body = ("Daily check-in — watching %d %s: %s. Quiet in between means "
+                "all is well." % (len(states),
+                                  "entry" if len(states) == 1 else "entries",
+                                  "; ".join(parts)))
+    if alert("All quiet" if all(s == "healthy" for s in states.values())
+             else "Daily check-in", body):
+        stamp.touch()
 
 
 def cmd_selfcheck():

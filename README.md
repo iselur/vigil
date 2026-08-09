@@ -22,6 +22,8 @@ One Python file, stdlib only. One hourly timer. No daemon.
   check instead of double-launching. Strikes are spent at intent time, so failed
   launches consume the budget too. Two strikes, then quarantine until `vigil reset`.
 - **Watched watchdog**: `vigil selfcheck` on an independent cron alerts if checks stop.
+- **Daily heartbeat**: once a day, one "all quiet" note listing what's watched — so
+  silence is provably deliberate. `VIGIL_HEARTBEAT_H=0` disables, or set another cadence.
 
 ## Commands
 
@@ -38,6 +40,8 @@ caught. Live kill/resume verified against real Claude Code and Codex CLI session
 
 - `~/.config/vigil/sources.json` — work lists to watch (markdown-table ledgers).
 - `~/.config/vigil/alert.env` — `NTFY_TOPIC=<topic>`; subscribe in the ntfy app.
+  **The topic name is a secret** — anyone who knows it can read and send your
+  notifications. Generate a long random one and keep it out of your repos.
 - systemd user timer runs `vigil check` hourly; a cron line runs `vigil selfcheck`.
 
 Recovery is at-least-once: a resumed session is told to reconcile observed state before

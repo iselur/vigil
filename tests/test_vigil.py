@@ -313,6 +313,39 @@ class KillTest(unittest.TestCase):
         self.assertFalse(self.argv_log.exists())
         lock.close()
 
+    def live_claim(self):
+        p = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(p.kill)
+        st = vigil.proc_starttime(p.pid)
+        claims = self.state / "claims"
+        claims.mkdir(parents=True, exist_ok=True)
+        (claims / "R900.json").write_text(json.dumps(
+            {"entry": "R900", "session": self.session, "vendor": "claude",
+             "pid": p.pid, "starttime": st, "generation": 1, "policy": {},
+             "workdir": str(self.work),
+             "created": "x", "created_epoch": time.time() - 3600}))
+
+    def test_daily_heartbeat_once_then_quiet(self):
+        self.live_claim()
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        beats = [b for _, t, b in NtfyRecorder.posts if "Daily check-in" in b
+                 or "watching" in b]
+        self.assertEqual(len(beats), 1, NtfyRecorder.posts)
+        self.assertIn("R900 healthy", beats[0])
+        r2 = self.check()
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        beats2 = [b for _, t, b in NtfyRecorder.posts if "watching" in b]
+        self.assertEqual(len(beats2), 1)  # not repeated within the day
+
+    def test_heartbeat_disabled_by_zero(self):
+        self.live_claim()
+        env = self.env(); env["VIGIL_HEARTBEAT_H"] = "0"
+        r = subprocess.run([PY, str(ROOT / "vigil.py"), "check"], env=env,
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(NtfyRecorder.posts, [])
+
     def test_source_parse_failure_alerts_not_silent(self):
         self.ledger.write_text("| broken | row |\n")
         r = self.check()
