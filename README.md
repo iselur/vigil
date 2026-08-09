@@ -31,7 +31,7 @@ One Python file, stdlib only. One hourly timer. No daemon.
 
 ## Enforcement
 
-19-test suite: effect-level kill-test against fake vendor binaries and a fake ntfy
+21-test suite: effect-level kill-test against fake vendor binaries and a fake ntfy
 server, crash injection at every intent/launch/commit boundary, lock contention,
 UNKNOWN-vs-DEAD separation. Mutation campaign on the pure decision core: 10/10 mutants
 caught. Live kill/resume verified against real Claude Code and Codex CLI sessions.
