@@ -376,6 +376,15 @@ class KillTest(unittest.TestCase):
         self.assertNotIn("blocked", json.loads(
             (self.state / "claims" / "R900.json").read_text()))
 
+    def test_ask_reaches_the_owner(self):
+        r = subprocess.run([PY, str(ROOT / "vigil.py"), "ask", "Ledger is empty.",
+                            "Backlog has 2 parked items. Want anything started?"],
+                           env=self.env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(any("session has a question" in t
+                            for _, t, _ in NtfyRecorder.posts))
+        self.assertTrue(any("Ledger is empty" in b for _, _, b in NtfyRecorder.posts))
+
     def test_source_parse_failure_alerts_not_silent(self):
         self.ledger.write_text("| broken | row |\n")
         r = self.check()

@@ -737,6 +737,18 @@ def cmd_blocked(argv):
     return 0
 
 
+def cmd_ask(argv):
+    """A sanctioned channel for any session to put one question on the owner's phone."""
+    text = " ".join(argv).strip()
+    if not text:
+        print("vigil: usage: vigil ask \"<question for the owner>\"", file=sys.stderr)
+        return 2
+    append_incident(event="ask", entry="-", note=text[:120])
+    ok = alert("A session has a question", text)
+    print("vigil: ask %s" % ("delivered" if ok else "recorded (delivery pending)"))
+    return 0
+
+
 def cmd_reset(argv):
     entry = argv[0] if argv else ""
     if not ENTRY_RE.match(entry):
@@ -785,11 +797,13 @@ def main():
         return cmd_beat(rest)
     if cmd == "blocked":
         return cmd_blocked(rest)
+    if cmd == "ask":
+        return cmd_ask(rest)
     if cmd == "reset":
         return cmd_reset(rest)
     if cmd == "status":
         return cmd_status()
-    print("usage: vigil [check|selfcheck|claim|beat|blocked|reset|status]", file=sys.stderr)
+    print("usage: vigil [check|selfcheck|claim|beat|blocked|ask|reset|status]", file=sys.stderr)
     return 2
 
 

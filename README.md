@@ -32,7 +32,7 @@ One Python file, stdlib only. One hourly timer. No daemon.
 
 ## Commands
 
-    vigil check | selfcheck | claim | beat | blocked | reset | status
+    vigil check | selfcheck | claim | beat | blocked | ask | reset | status
 
 ## Enforcement
 
