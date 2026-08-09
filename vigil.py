@@ -277,7 +277,7 @@ def replay_pending_alerts():
     p.unlink()
     for ln in lines:
         title, _, msg = ln.partition(" | ")
-        alert("(replay) " + title.split(" ", 1)[-1], msg)
+        alert("(missed earlier) " + title, msg)
 
 
 # ---------- the pure decision core (mutation-campaign target) ----------
@@ -324,22 +324,26 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok):
                 recover = entry
             else:
                 alerts.append((entry, "memory-low",
-                               "%s is orphaned but free memory is low; not resuming"
-                               % entry))
+                               "The session working on %s died, but the machine "
+                               "is low on memory, so I'm waiting instead of "
+                               "restarting it." % entry))
     return {"states": states, "alerts": alerts, "recover": recover,
             "notified": new_notified}
 
 
 def _alert_text(entry, state, strikes):
     if state == "unclaimed":
-        return "%s is open but no session ever claimed it" % entry
+        return ("%s is open in the ledger, but no session ever picked it up."
+                % entry)
     if state == "unknown":
-        return ("%s: cannot verify its session is alive (observation failure, "
-                "not death) — check manually" % entry)
+        return ("I can't tell whether the session working on %s is still alive "
+                "— the check itself failed, so the session may be fine. Worth "
+                "a look." % entry)
     if state == "quarantined":
-        return ("%s: session died %d times — quarantined. Run: vigil reset %s"
+        return ("The session working on %s died %d times, so I've stopped "
+                "retrying. When you're ready: vigil reset %s"
                 % (entry, strikes.get(entry, 0), entry))
-    return "%s: owning session is dead — resuming it now" % entry
+    return "The session working on %s died — restarting it now." % entry
 
 
 # ---------- recovery ----------
@@ -447,13 +451,15 @@ def recover(entry, claim, strikes):
     if not preflight(claim):
         append_incident(event="fail", attempt=attempt, entry=entry,
                         note="preflight:continuity-unprovable")
-        alert("vigil: quarantine %s" % entry,
-              "%s: cannot prove session continuity (transcript/thread missing or "
-              "corrupt); NOT resuming. Manual attention needed." % entry)
+        alert("%s can't be restored" % entry,
+              "The session working on %s died, and its saved transcript can't "
+              "prove a safe restart — so I won't try. This one needs you."
+              % entry)
         return False
-    alert("vigil: resuming %s" % entry,
-          "%s: owner dead; resuming session %s (strike %d/%d)"
-          % (entry, claim["session"][:8], strikes.get(entry, 0) + 1, MAX_STRIKES),
+    alert("Restarting work on %s" % entry,
+          "The session working on %s died. I'm restarting it now "
+          "(attempt %d of %d)."
+          % (entry, strikes.get(entry, 0) + 1, MAX_STRIKES),
           require_ack=True)
     fault("post-alert")
     prompt = build_prompt(claim, strikes)
@@ -531,8 +537,9 @@ def cmd_check():
         for name, err in errors:
             key = "_source:%s" % name
             if notified.get(key) != "error":
-                alert("vigil: source unreadable",
-                      "source %s failed to parse: %s" % (name, err))
+                alert("Can't read the work list",
+                      "I can't read the '%s' ledger, so I can't see what work "
+                      "is open until it's fixed. (%s)" % (name, err))
                 notified[key] = "error"
         if not errors:
             for k in [k for k in notified if k.startswith("_source:")]:
@@ -543,9 +550,13 @@ def cmd_check():
         workdirs = {e: s.get("workdir") for e, s in entries_src}
         live = {e: liveness(claims[e]) for e in entries if e in claims}
         d = decide(entries, claims, live, strikes, notified, time.time(), mem_ok())
+        titles = {"unclaimed": "%s has no one on it",
+                  "unknown": "Can't check on %s",
+                  "quarantined": "%s needs you",
+                  "memory-low": "%s is waiting"}
         for entry, state, msg in d["alerts"]:
             if state != "orphaned":  # recovery announces itself with ack inside recover()
-                alert("vigil: %s %s" % (entry, state), msg)
+                alert(titles.get(state, "%s: " + state) % entry, msg)
         if d["recover"]:
             claim = dict(claims[d["recover"]])
             claim.setdefault("workdir", workdirs.get(d["recover"]))
@@ -566,9 +577,9 @@ def cmd_selfcheck():
     if age > 2 * CYCLE_S + 600:
         notified = read_json(STATE / "notified.json", {})
         if notified.get("_selfcheck") != "stale":
-            alert("vigil: watchdog stalled",
-                  "vigil check has not completed for %dh — the watchdog itself "
-                  "needs attention" % int(age // 3600))
+            alert("The watchdog stopped",
+                  "No checks have completed for %d hours — the watchdog itself "
+                  "needs attention." % int(age // 3600))
             notified["_selfcheck"] = "stale"
             write_json(STATE / "notified.json", notified)
     else:

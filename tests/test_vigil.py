@@ -60,13 +60,14 @@ class DecideTests(unittest.TestCase):
                    strikes={"E1": vigil.MAX_STRIKES})
         self.assertEqual(r["states"]["E1"], "quarantined")
         self.assertIsNone(r["recover"])
-        self.assertIn("quarantined", r["alerts"][0][2])
+        self.assertIn("stopped", r["alerts"][0][2])
+        self.assertIn("vigil reset E1", r["alerts"][0][2])
 
     def test_unknown_alerts_but_never_recovers(self):
         r = self.d(claims={"E1": self.claim()}, live={"E1": "unknown"})
         self.assertEqual(r["states"]["E1"], "unknown")
         self.assertIsNone(r["recover"])
-        self.assertIn("observation failure", r["alerts"][0][2])
+        self.assertIn("check itself failed", r["alerts"][0][2])
 
     def test_low_memory_blocks_recovery_and_alerts(self):
         r = self.d(claims={"E1": self.claim()}, live={"E1": "dead"}, mem_ok=False)
@@ -227,7 +228,7 @@ class KillTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         # effect 1: alert reached the (fake) server before launch
         titles = [t for _, t, _ in NtfyRecorder.posts]
-        self.assertTrue(any("resuming R900" in t for t in titles), titles)
+        self.assertTrue(any("Restarting work on R900" in t for t in titles), titles)
         # effect 2: launch used an exact argv vector, no shell
         argv = self.argv_log.read_text().splitlines()
         self.assertIn("new-session", argv)
@@ -273,7 +274,7 @@ class KillTest(unittest.TestCase):
         r3 = self.check()
         self.assertEqual(r3.returncode, 0, r3.stderr)
         self.assertEqual(self.argv_log.read_text().splitlines().count("new-session"), 1)
-        self.assertTrue(any("quarantined" in b for _, _, b in NtfyRecorder.posts))
+        self.assertTrue(any("stopped retrying" in b.replace("\n", " ") for _, _, b in NtfyRecorder.posts))
 
     def test_crash_after_launch_reconciles_to_commit_not_double_launch(self):
         self.dead_claim()
@@ -297,7 +298,7 @@ class KillTest(unittest.TestCase):
         r = self.check()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(self.argv_log.exists())
-        self.assertTrue(any("observation failure" in b
+        self.assertTrue(any("check itself failed" in b
                             for _, _, b in NtfyRecorder.posts))
 
     def test_lock_blocks_second_checker(self):
@@ -316,7 +317,7 @@ class KillTest(unittest.TestCase):
         self.ledger.write_text("| broken | row |\n")
         r = self.check()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertTrue(any("source unreadable" in t
+        self.assertTrue(any("read the work list" in t
                             for _, t, _ in NtfyRecorder.posts))
 
 
