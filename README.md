@@ -24,10 +24,15 @@ One Python file, stdlib only. One hourly timer. No daemon.
 - **Watched watchdog**: `vigil selfcheck` on an independent cron alerts if checks stop.
 - **Daily heartbeat**: once a day, one "all quiet" note listing what's watched — so
   silence is provably deliberate. `VIGIL_HEARTBEAT_H=0` disables, or set another cadence.
+- **Blocked on a human**: a session that needs a decision runs `vigil blocked <id>
+  "the ask" --recommend <answer> --by <deadline>` — the owner's phone gets the question
+  immediately, and the entry shows as blocked in status and the daily heartbeat until
+  `vigil blocked <id> --clear`. vigil relays the ask; acting on the deadline default is
+  the session's job, per whatever convention its repo sets.
 
 ## Commands
 
-    vigil check | selfcheck | claim | beat | reset | status
+    vigil check | selfcheck | claim | beat | blocked | reset | status
 
 ## Enforcement
 

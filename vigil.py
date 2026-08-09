@@ -305,7 +305,7 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok):
         else:
             lv = live.get(entry, UNKNOWN)
             if lv == ALIVE:
-                state = "healthy"
+                state = "blocked" if claim.get("blocked") else "healthy"
             elif lv == UNKNOWN:
                 state = "unknown"
             elif strikes.get(entry, 0) >= MAX_STRIKES:
@@ -339,6 +339,9 @@ def _alert_text(entry, state, strikes):
         return ("I can't tell whether the session working on %s is still alive "
                 "— the check itself failed, so the session may be fine. Worth "
                 "a look." % entry)
+    if state == "blocked":
+        return ("%s is waiting on a decision from you — details were sent when "
+                "it blocked; `vigil status` shows the ask." % entry)
     if state == "quarantined":
         return ("The session working on %s died %d times, so I've stopped "
                 "retrying. When you're ready: vigil reset %s"
@@ -430,15 +433,20 @@ def build_prompt(claim, strikes):
                 tail.append(ln)
     except OSError:
         pass
+    pending = ""
+    if claim.get("blocked"):
+        pending = ("Pending owner ask you had raised: %s\n"
+                   % claim["blocked"]["ask"])
     return (
         "vigil auto-resume: your session owned open work '%s' and was found dead. "
         "Strike %d of %d. Recovery is at-least-once: reconcile observed state "
         "(files, PRs, running units) before repeating any action not confirmed in "
-        "your transcript. Recent incidents:\n%s\n"
+        "your transcript. Recent incidents:\n%s\n%s"
         "Re-claim with: vigil claim %s --session <your-session-id> --vendor %s, "
         "then continue the work."
         % (claim["entry"], strikes.get(claim["entry"], 0) + 1, MAX_STRIKES,
-           "\n".join(tail[-2:]) or "(none)", claim["entry"], claim["vendor"])
+           "\n".join(tail[-2:]) or "(none)", pending, claim["entry"],
+           claim["vendor"])
     )
 
 
@@ -685,6 +693,50 @@ def cmd_beat(argv):
     return 0
 
 
+def cmd_blocked(argv):
+    import argparse
+    ap = argparse.ArgumentParser(prog="vigil blocked")
+    ap.add_argument("entry")
+    ap.add_argument("ask", nargs="?", default="")
+    ap.add_argument("--recommend", default="")
+    ap.add_argument("--by", default="", help="deadline, e.g. 18:00 or 2026-08-09T18:00")
+    ap.add_argument("--clear", action="store_true")
+    a = ap.parse_args(argv)
+    path = claims_dir() / ("%s.json" % a.entry)
+    claim = read_json(path, None)
+    if not ENTRY_RE.match(a.entry) or claim is None:
+        print("vigil: no claim for %r — claim it first" % a.entry, file=sys.stderr)
+        return 2
+    notified = read_json(STATE / "notified.json", {})
+    if a.clear:
+        claim.pop("blocked", None)
+        write_json(path, claim)
+        notified.pop(a.entry, None)
+        write_json(STATE / "notified.json", notified)
+        append_incident(event="unblocked", entry=a.entry)
+        print("vigil: %s unblocked" % a.entry)
+        return 0
+    if not a.ask:
+        print("vigil: an ask is required (what decision do you need?)",
+              file=sys.stderr)
+        return 2
+    claim["blocked"] = {"ask": a.ask, "recommend": a.recommend, "by": a.by,
+                        "created": now_iso()}
+    write_json(path, claim)
+    append_incident(event="blocked", entry=a.entry)
+    body = "%s is blocked on you: %s" % (a.entry, a.ask)
+    if a.recommend:
+        body += " Recommended: %s." % a.recommend
+    if a.by:
+        body += (" If there's no answer by %s, the session proceeds with the "
+                 "recommendation." % a.by)
+    alert("%s needs a decision" % a.entry, body)
+    notified[a.entry] = "blocked"
+    write_json(STATE / "notified.json", notified)
+    print("vigil: %s marked blocked; owner alerted" % a.entry)
+    return 0
+
+
 def cmd_reset(argv):
     entry = argv[0] if argv else ""
     if not ENTRY_RE.match(entry):
@@ -709,6 +761,12 @@ def cmd_status():
         lv = liveness(c) if c else "-"
         print("  %-12s claim=%-5s live=%-7s strikes=%d"
               % (e, "yes" if c else "no", lv, strikes.get(e, 0)))
+        if c and c.get("blocked"):
+            b = c["blocked"]
+            print("      blocked on you: %s%s%s" % (
+                b["ask"],
+                " — recommended: %s" % b["recommend"] if b.get("recommend") else "",
+                " — deadline: %s" % b["by"] if b.get("by") else ""))
     for name, err in errors:
         print("  SOURCE ERROR %s: %s" % (name, err))
     return 0
@@ -725,11 +783,13 @@ def main():
         return cmd_claim(rest)
     if cmd == "beat":
         return cmd_beat(rest)
+    if cmd == "blocked":
+        return cmd_blocked(rest)
     if cmd == "reset":
         return cmd_reset(rest)
     if cmd == "status":
         return cmd_status()
-    print("usage: vigil [check|selfcheck|claim|beat|reset|status]", file=sys.stderr)
+    print("usage: vigil [check|selfcheck|claim|beat|blocked|reset|status]", file=sys.stderr)
     return 2
 
 

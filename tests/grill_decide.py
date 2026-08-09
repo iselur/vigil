@@ -22,8 +22,7 @@ BACKUP = ROOT / "vigil.py.grillbak"
 MUTANTS = [
     ("cold-start boundary", "< COLD_START_S", "<= COLD_START_S"),
     ("strike budget boundary", ">= MAX_STRIKES", "> MAX_STRIKES"),
-    ("alive inverted", 'if lv == ALIVE:\n                state = "healthy"',
-     'if lv != ALIVE:\n                state = "healthy"'),
+    ("alive inverted", "if lv == ALIVE:", "if lv != ALIVE:"),
     ("alert dedupe deleted",
      'if state != notified.get(entry, "healthy") and state != "healthy":',
      'if state != "healthy":'),
@@ -39,6 +38,9 @@ MUTANTS = [
      "for entry in entries:"),
     ("quarantine collapses to orphaned",
      'state = "quarantined"', 'state = "orphaned"'),
+    ("blocked collapses to healthy",
+     'state = "blocked" if claim.get("blocked") else "healthy"',
+     'state = "healthy"'),
 ]
 
 

@@ -79,6 +79,13 @@ class DecideTests(unittest.TestCase):
                    notified={"E1": "orphaned"})
         self.assertNotIn("E1", r["notified"])
 
+    def test_blocked_claim_is_blocked_not_healthy(self):
+        r = self.d(claims={"E1": dict(self.claim(), blocked={"ask": "promote?"})},
+                   live={"E1": "alive"})
+        self.assertEqual(r["states"]["E1"], "blocked")
+        self.assertIsNone(r["recover"])
+        self.assertIn("waiting on a decision", r["alerts"][0][2])
+
     def test_one_recovery_per_cycle(self):
         r = self.d(entries=["E2", "E1"],
                    claims={"E1": self.claim(), "E2": dict(self.claim(), entry="E2")},
@@ -345,6 +352,29 @@ class KillTest(unittest.TestCase):
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(NtfyRecorder.posts, [])
+
+    def test_blocked_command_alerts_and_heartbeat_lists_it(self):
+        self.live_claim()
+        r = subprocess.run([PY, str(ROOT / "vigil.py"), "blocked", "R900",
+                            "Promote PR #1 to main?", "--recommend", "yes",
+                            "--by", "18:00"], env=self.env(),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(any("needs a decision" in t for _, t, _ in NtfyRecorder.posts))
+        body = [b for _, t, b in NtfyRecorder.posts if "needs a decision" in t][0]
+        self.assertIn("Promote PR #1 to main?", body)
+        self.assertIn("Recommended: yes", body)
+        self.assertIn("18:00", body)
+        c = self.check()
+        self.assertEqual(c.returncode, 0, c.stderr)
+        beats = [b for _, t, b in NtfyRecorder.posts if "watching" in b]
+        self.assertTrue(any("R900 blocked" in b for b in beats), beats)
+        r2 = subprocess.run([PY, str(ROOT / "vigil.py"), "blocked", "R900",
+                             "--clear"], env=self.env(),
+                            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertNotIn("blocked", json.loads(
+            (self.state / "claims" / "R900.json").read_text()))
 
     def test_source_parse_failure_alerts_not_silent(self):
         self.ledger.write_text("| broken | row |\n")
