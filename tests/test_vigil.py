@@ -290,6 +290,24 @@ class ClaimLockTests(unittest.TestCase):
                 self.entry, "--session", "native-1", "--", sys.executable,
                 "-c", "raise SystemExit(0)"],), 2)
 
+    def test_claim_rejects_whitespace_session_without_mutating(self):
+        before = self.claim_path.read_bytes()
+        self.assertEqual(vigil.cmd_claim([
+            self.entry, "--session", " \t ", "--vendor", "codex",
+            "--pid", str(self.pid),
+        ]), 2)
+        self.assertEqual(self.claim_path.read_bytes(), before)
+
+    def test_guard_rejects_whitespace_session_without_mutating(self):
+        self.claim_path.write_text(json.dumps(dict(self.claim, session=" \t ")))
+        before = self.claim_path.read_bytes()
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "codex")):
+            self.assertEqual(vigil.cmd_guard([
+                self.entry, "--session", " \t ", "--", sys.executable,
+                "-c", "raise SystemExit(0)"],), 2)
+        self.assertEqual(self.claim_path.read_bytes(), before)
+
     def test_guard_refuses_missing_workdir_and_nonpositive_generation(self):
         for field, value in (("workdir", ""), ("generation", 0)):
             claim = dict(self.claim, **{field: value})

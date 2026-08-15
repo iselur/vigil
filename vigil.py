@@ -177,7 +177,7 @@ def claim_path(entry):
 
 def load_claim_strict(entry, session):
     """Reload the current claim under the caller's already-held entry lock."""
-    if not isinstance(session, str) or not session:
+    if not isinstance(session, str) or not session.strip():
         raise ValueError("invalid session")
     path = claim_path(entry)
     try:
@@ -186,7 +186,10 @@ def load_claim_strict(entry, session):
         raise ValueError("invalid claim") from exc
     if not isinstance(claim, dict) or claim.get("entry") != entry:
         raise ValueError("invalid claim")
-    if claim.get("session") != session:
+    claim_session = claim.get("session")
+    if not isinstance(claim_session, str) or not claim_session.strip():
+        raise ValueError("invalid claim session")
+    if claim_session != session:
         raise ValueError("claim session mismatch")
     if claim.get("vendor") not in ("claude", "codex"):
         raise ValueError("invalid claim vendor")
@@ -904,6 +907,9 @@ def cmd_claim(argv):
     a = ap.parse_args(argv)
     if not ENTRY_RE.fullmatch(a.entry):
         print("vigil: invalid entry id", file=sys.stderr)
+        return 2
+    if not a.session.strip():
+        print("vigil: invalid session", file=sys.stderr)
         return 2
     pid = a.pid or _find_agent_pid()
     if pid is None:
