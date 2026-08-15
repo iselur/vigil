@@ -31,12 +31,43 @@ class DecideTests(unittest.TestCase):
     def claim(self, age=9999):
         return {"entry": "E1", "created_epoch": 1000000.0 - age}
 
-    def test_unclaimed_alerts_once_then_dedupes(self):
-        r1 = self.d()
-        self.assertEqual(r1["states"]["E1"], "unclaimed")
+    def test_unclaimed_is_started_not_reported(self):
+        # Reporting an unclaimed row asks the owner to be the scheduler. vigil already knows
+        # how to launch a session; it just had no verb for "never claimed" (owner, 2026-08-14).
+        r = self.d()
+        self.assertEqual(r["states"]["E1"], "unclaimed")
+        self.assertEqual(r["start"], "E1")
+        self.assertEqual(r["alerts"], [])
+
+    def test_unclaimed_alerts_once_starting_is_exhausted(self):
+        r1 = self.d(starts={"E1": vigil.MAX_STARTS})
+        self.assertIsNone(r1["start"])
         self.assertEqual(len(r1["alerts"]), 1)
-        r2 = self.d(notified=r1["notified"])
+        r2 = self.d(starts={"E1": vigil.MAX_STARTS}, notified=r1["notified"])
         self.assertEqual(r2["alerts"], [])
+
+    def test_quiet_start_attempts_do_not_suppress_exhaustion_alert(self):
+        r1 = self.d(starts={})
+        self.assertEqual(r1["alerts"], [])
+        self.assertNotIn("E1", r1["notified"])
+        r2 = self.d(starts={"E1": 1}, notified=r1["notified"])
+        self.assertEqual(r2["alerts"], [])
+        self.assertNotIn("E1", r2["notified"])
+        r3 = self.d(starts={"E1": vigil.MAX_STARTS}, notified=r2["notified"])
+        self.assertEqual(len(r3["alerts"]), 1)
+        self.assertEqual(r3["notified"]["E1"], "unclaimed")
+
+    def test_low_memory_does_not_start_work(self):
+        r = self.d(mem_ok=False)
+        self.assertIsNone(r["start"])
+
+    def test_only_one_row_is_started_per_check(self):
+        r = self.d(entries=["E1", "E2"])
+        self.assertEqual(r["start"], "E1")
+
+    def test_a_claimed_row_is_never_started(self):
+        r = self.d(claims={"E1": self.claim()}, live={"E1": "alive"})
+        self.assertIsNone(r["start"])
 
     def test_cold_start_claim_is_healthy_and_silent(self):
         r = self.d(claims={"E1": self.claim(age=10)}, live={"E1": "dead"})
@@ -110,6 +141,24 @@ class ResumeArgvTests(unittest.TestCase):
         self.assertNotIn("bypassPermissions", argv)
 
 
+class StartArgvTests(unittest.TestCase):
+    def test_codex_start_is_sol_high_and_claims_as_codex(self):
+        argv = vigil.start_argv("E1", "/tmp", "codex")
+        self.assertEqual(argv[:8], [vigil.TMUX_BIN, "new-session", "-d", "-s",
+                                   "vigil-start-E1", "-c", "/tmp", "--"])
+        self.assertIn(vigil.CODEX_BIN, argv)
+        self.assertIn("gpt-5.6-sol", argv)
+        self.assertIn("model_reasoning_effort=high", argv)
+        self.assertIn("--vendor codex", argv[-1])
+        self.assertNotIn(vigil.CLAUDE_BIN, argv[8:-1])
+
+    def test_claude_start_claims_as_claude(self):
+        argv = vigil.start_argv("E1", "/tmp", "claude")
+        self.assertIn(vigil.CLAUDE_BIN, argv)
+        self.assertIn("--vendor claude", argv[-1])
+        self.assertNotIn(vigil.CODEX_BIN, argv[8:-1])
+
+
 class LedgerParseTests(unittest.TestCase):
     HDR = "| id | date | request | lane | plan-ref | status | evidence |\n|--|--|--|--|--|--|--|\n"
 
@@ -173,6 +222,9 @@ class KillTest(unittest.TestCase):
             'if [ "$1" = agents ]; then echo \'{"agents": []}\'; exit 0; fi\n'
             "sleep 60\n")
         fake_claude.chmod(0o755)
+        fake_codex = self.bins / "codex"
+        fake_codex.write_text("#!/bin/bash\nsleep 60\n")
+        fake_codex.chmod(0o755)
         # fake tmux: record argv, run the command after -- in background
         fake_tmux = self.bins / "tmux"
         fake_tmux.write_text(
@@ -194,11 +246,14 @@ class KillTest(unittest.TestCase):
         self.httpd.shutdown()
         subprocess.run(["pkill", "-f", str(self.bins / "claude")],
                        capture_output=True)
+        subprocess.run(["pkill", "-f", str(self.bins / "codex")],
+                       capture_output=True)
 
     def env(self, fault=""):
         e = dict(os.environ,
                  VIGIL_STATE=str(self.state), VIGIL_CONFIG=str(self.config),
                  VIGIL_CLAUDE=str(self.bins / "claude"),
+                 VIGIL_CODEX=str(self.bins / "codex"),
                  VIGIL_TMUX=str(self.bins / "tmux"),
                  VIGIL_NTFY=self.ntfy, VIGIL_MIN_FREE_KB="0",
                  HOME=str(self.home), TMUX_ARGV_LOG=str(self.argv_log))
@@ -257,6 +312,35 @@ class KillTest(unittest.TestCase):
         self.assertEqual(r2.returncode, 0, r2.stderr)
         self.assertEqual(self.argv_log.read_text().splitlines().count("new-session"), 1)
         self.assertEqual(len(NtfyRecorder.posts), n_alerts)
+
+    def test_unclaimed_start_uses_persisted_codex_vendor(self):
+        (self.config / "start-vendor").write_text("codex\n")
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = self.argv_log.read_text().splitlines()
+        self.assertIn(str(self.bins / "codex"), argv)
+        self.assertNotIn(str(self.bins / "claude"), argv)
+        self.assertIn("gpt-5.6-sol", argv)
+        self.assertIn("model_reasoning_effort=high", argv)
+        self.assertTrue(any("--vendor codex" in part for part in argv))
+
+    def test_vendor_command_switches_persistently(self):
+        for vendor in ("codex", "claude"):
+            r = subprocess.run([PY, str(ROOT / "vigil.py"), "vendor", vendor],
+                               env=self.env(), capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((self.config / "start-vendor").read_text(), vendor + "\n")
+            shown = subprocess.run([PY, str(ROOT / "vigil.py"), "vendor"],
+                                   env=self.env(), capture_output=True, text=True)
+            self.assertEqual(shown.stdout.strip(), vendor)
+
+    def test_unconfigured_start_fails_closed(self):
+        r = self.check()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.argv_log.exists())
+        log = (self.state / "incidents.log").read_text()
+        self.assertIn("why=start_vendor_unconfigured", log)
+        self.assertNotIn("event=start", log)
 
     def test_crash_after_intent_consumes_strike_and_reconciles(self):
         self.dead_claim()
