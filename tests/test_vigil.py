@@ -15,6 +15,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Keep every direct import and grill-spawned unittest process away from the
+# user's real state/config, even when a test fails before restoring globals.
+_TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="vigil-suite-state-")
+_TEST_CONFIG_DIR = tempfile.TemporaryDirectory(prefix="vigil-suite-config-")
+os.environ["VIGIL_STATE"] = _TEST_STATE_DIR.name
+os.environ["VIGIL_CONFIG"] = _TEST_CONFIG_DIR.name
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import vigil  # noqa: E402
@@ -164,6 +171,11 @@ class StartArgvTests(unittest.TestCase):
 
 class ClaimLockTests(unittest.TestCase):
     def setUp(self):
+        self._threads = []
+        self._release_events = []
+        self._release_paths = []
+        self._processes = []
+        self.sandbox_state = Path(_TEST_STATE_DIR.name)
         self.tmp = Path(tempfile.mkdtemp(prefix="vigil-lock-test-"))
         self.state = self.tmp / "state"
         self.state.mkdir()
@@ -184,7 +196,22 @@ class ClaimLockTests(unittest.TestCase):
         self.claim_path.write_text(json.dumps(self.claim))
 
     def tearDown(self):
-        vigil.STATE = self.old_state
+        for event in self._release_events:
+            event.set()
+        for path in self._release_paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("yes")
+        for process in self._processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        for thread in self._threads:
+            if thread.ident is not None:
+                thread.join(timeout=5)
+        alive = [thread.name for thread in self._threads if thread.is_alive()]
+        vigil.STATE = self.sandbox_state
+        if alive:
+            self.fail("test threads survived teardown: %s" % ", ".join(alive))
         for path in self.state.rglob("*"):
             if path.is_file():
                 path.unlink()
@@ -193,6 +220,22 @@ class ClaimLockTests(unittest.TestCase):
                 path.rmdir()
         self.state.rmdir()
 
+    def start_thread(self, target, name, release_event=None, release_path=None,
+                    start=True):
+        if release_event is not None:
+            self._release_events.append(release_event)
+        if release_path is not None:
+            self._release_paths.append(Path(release_path))
+        thread = threading.Thread(target=target, name=name)
+        self._threads.append(thread)
+        if start:
+            thread.start()
+        return thread
+
+    def track_process(self, process):
+        self._processes.append(process)
+        return process
+
     def test_entry_lock_is_stable_and_validated(self):
         with vigil.entry_lock(self.entry):
             lock = self.state / "claim-locks" / (self.entry + ".lock")
@@ -200,6 +243,23 @@ class ClaimLockTests(unittest.TestCase):
             self.assertEqual(vigil.claim_lock_path(self.entry), lock)
         with self.assertRaises(ValueError):
             vigil.claim_lock_path("../escape")
+
+    def test_claim_commands_leave_external_production_like_state_unchanged(self):
+        external = self.tmp / "production-like" / ".local" / "state" / "vigil"
+        external_claim = external / "claims" / (self.entry + ".json")
+        external_claim.parent.mkdir(parents=True)
+        external_claim.write_bytes(b'{"sentinel":"unchanged"}\n')
+        before = external_claim.read_bytes()
+        self.assertTrue(self.sandbox_state.is_relative_to(
+            Path(_TEST_STATE_DIR.name)))
+        self.assertEqual(vigil.cmd_claim([
+            self.entry, "--session", "native-2", "--vendor", "codex",
+            "--pid", str(self.pid)]), 0)
+        with mock.patch.object(vigil, "alert", return_value=True):
+            self.assertEqual(vigil.cmd_blocked([
+                self.entry, "owner ask", "--recommend", "continue",
+                "--by", "later"]), 0)
+        self.assertEqual(external_claim.read_bytes(), before)
 
     def test_guard_exports_claim_and_propagates_child_exit(self):
         child = (
@@ -226,10 +286,9 @@ class ClaimLockTests(unittest.TestCase):
         errors = []
         with mock.patch.object(vigil, "_find_agent_process",
                                return_value=(self.pid, self.starttime, "codex")):
-            worker = threading.Thread(target=lambda: vigil.cmd_guard([
+            worker = self.start_thread(lambda: vigil.cmd_guard([
                 self.entry, "--session", "native-1", "--", sys.executable,
-                "-c", child]))
-            worker.start()
+                "-c", child]), "guard-worker", release_path=release_child)
             for _ in range(500):
                 if started.exists():
                     break
@@ -253,8 +312,8 @@ class ClaimLockTests(unittest.TestCase):
                     contender_reached.set()
                 return real_flock(handle, operation)
 
-            contender_thread = threading.Thread(target=contender,
-                                                name="guard-contender")
+            contender_thread = self.start_thread(contender, "guard-contender",
+                                                 start=False)
             with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
                 contender_thread.start()
                 self.assertTrue(contender_reached.wait(5))
@@ -392,11 +451,10 @@ class ClaimLockTests(unittest.TestCase):
         transfer_result = []
         with mock.patch.object(vigil, "_find_agent_process",
                                return_value=(self.pid, self.starttime, "codex")):
-            guard = threading.Thread(
-                target=lambda: guard_result.append(vigil.cmd_guard([
+            guard = self.start_thread(
+                lambda: guard_result.append(vigil.cmd_guard([
                     self.entry, "--session", "native-1", "--", sys.executable,
-                    "-c", child]),), name="guard-consumer")
-            guard.start()
+                    "-c", child]),), "guard-consumer", release_path=release_guard)
             for _ in range(500):
                 if started.exists():
                     break
@@ -417,7 +475,7 @@ class ClaimLockTests(unittest.TestCase):
                     "--pid", str(self.pid)]))
 
             with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
-                writer = threading.Thread(target=transfer, name="real-transfer")
+                writer = self.start_thread(transfer, "real-transfer", start=False)
                 writer.start()
                 self.assertTrue(transfer_reached.wait(5))
                 self.assertEqual(json.loads(self.claim_path.read_text())["session"],
@@ -437,10 +495,8 @@ class ClaimLockTests(unittest.TestCase):
             ("codex", "codex", "same-session", "same-session"),
         )
         for n, (old_vendor, new_vendor, old_session, new_session) in enumerate(cases):
-            old_proc = subprocess.Popen(["sleep", "30"])
-            new_proc = subprocess.Popen(["sleep", "30"])
-            self.addCleanup(lambda p: (p.kill(), p.wait()), old_proc)
-            self.addCleanup(lambda p: (p.kill(), p.wait()), new_proc)
+            old_proc = self.track_process(subprocess.Popen(["sleep", "30"]))
+            new_proc = self.track_process(subprocess.Popen(["sleep", "30"]))
             old_start = vigil.proc_starttime(old_proc.pid)
             new_start = vigil.proc_starttime(new_proc.pid)
             old_claim = dict(self.claim, vendor=old_vendor, session=old_session,
@@ -475,11 +531,11 @@ class ClaimLockTests(unittest.TestCase):
             transfer_result = []
             with mock.patch.object(vigil, "_find_agent_process",
                                    return_value=(old_proc.pid, old_start, old_vendor)):
-                guard = threading.Thread(target=lambda: guard_result.append(
+                guard = self.start_thread(lambda: guard_result.append(
                     vigil.cmd_guard([
                         self.entry, "--session", old_session, "--", sys.executable,
-                        "-c", child])), name="matrix-guard-%d" % n)
-                guard.start()
+                        "-c", child])), "matrix-guard-%d" % n,
+                    release_path=release)
                 for _ in range(500):
                     if started.exists():
                         break
@@ -500,8 +556,8 @@ class ClaimLockTests(unittest.TestCase):
                         "--pid", str(new_proc.pid)]))
 
                 with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
-                    writer = threading.Thread(target=transfer,
-                                              name="matrix-transfer-%d" % n)
+                    writer = self.start_thread(
+                        transfer, "matrix-transfer-%d" % n, start=False)
                     writer.start()
                     self.assertTrue(transfer_reached.wait(5))
                     self.assertEqual(json.loads(self.claim_path.read_text())["session"],
@@ -578,10 +634,11 @@ class ClaimLockTests(unittest.TestCase):
 
         with mock.patch.object(vigil, "write_json", side_effect=write_json), \
                 mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
-            recovery = threading.Thread(target=recover, name="recovery")
+            recovery = self.start_thread(recover, "recovery",
+                                         release_event=release, start=False)
             recovery.start()
             self.assertTrue(reached.wait(5))
-            writer = threading.Thread(target=transfer, name="recovery-transfer")
+            writer = self.start_thread(transfer, "recovery-transfer", start=False)
             writer.start()
             self.assertTrue(transfer_reached.wait(5))
             self.assertEqual(json.loads(self.claim_path.read_text())["session"],
@@ -642,10 +699,12 @@ class ClaimLockTests(unittest.TestCase):
 
         with mock.patch.object(vigil, "find_resumed", side_effect=find_resumed), \
                 mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
-            reconcile = threading.Thread(target=vigil.reconcile, name="dangling-reconcile")
+            reconcile = self.start_thread(
+                vigil.reconcile, "dangling-reconcile",
+                release_event=release_found, start=False)
             reconcile.start()
             self.assertTrue(found_reached.wait(5))
-            writer = threading.Thread(target=transfer, name="dangling-transfer")
+            writer = self.start_thread(transfer, "dangling-transfer", start=False)
             writer.start()
             self.assertTrue(transfer_reached.wait(5))
             self.assertEqual(json.loads(self.claim_path.read_text())["session"],
@@ -676,8 +735,7 @@ class ClaimLockTests(unittest.TestCase):
                 entered.set()
                 release.wait(5)
 
-        holder = threading.Thread(target=hold, name="lock-holder")
-        holder.start()
+        holder = self.start_thread(hold, "lock-holder", release_event=release)
         self.assertTrue(entered.wait(5))
         finished = threading.Event()
         writer_reached = threading.Event()
@@ -699,7 +757,7 @@ class ClaimLockTests(unittest.TestCase):
                 writer_reached.set()
             return real_flock(handle, operation)
 
-        worker = threading.Thread(target=run, name="lock-writer")
+        worker = self.start_thread(run, "lock-writer", start=False)
         with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
             worker.start()
             self.assertTrue(writer_reached.wait(5))
@@ -769,6 +827,8 @@ class NtfyRecorder(http.server.BaseHTTPRequestHandler):
 
 class KillTest(unittest.TestCase):
     def setUp(self):
+        self._threads = []
+        self._processes = []
         self.tmp = Path(tempfile.mkdtemp(prefix="vigil-test-"))
         self.state = self.tmp / "state"
         self.config = self.tmp / "config"
@@ -816,15 +876,32 @@ class KillTest(unittest.TestCase):
         # ntfy recorder
         NtfyRecorder.posts = []
         self.httpd = http.server.HTTPServer(("127.0.0.1", 0), NtfyRecorder)
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.http_thread = threading.Thread(target=self.httpd.serve_forever,
+                                            name="ntfy-server", daemon=True)
+        self._threads.append(self.http_thread)
+        self.http_thread.start()
         self.ntfy = "http://127.0.0.1:%d/topic" % self.httpd.server_port
 
     def tearDown(self):
         self.httpd.shutdown()
-        subprocess.run(["pkill", "-f", str(self.bins / "claude")],
-                       capture_output=True)
-        subprocess.run(["pkill", "-f", str(self.bins / "codex")],
-                       capture_output=True)
+        self.httpd.server_close()
+        self.http_thread.join(timeout=5)
+        for process in self._processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        for binary in (self.bins / "claude", self.bins / "codex"):
+            subprocess.run(["pkill", "-f", str(binary)], capture_output=True)
+            for _ in range(50):
+                remaining = subprocess.run(["pgrep", "-f", str(binary)],
+                                           capture_output=True)
+                if remaining.returncode != 0:
+                    break
+                time.sleep(.01)
+            self.assertNotEqual(remaining.returncode, 0,
+                                "test process survived teardown: %s" % binary)
+        alive = [thread.name for thread in self._threads if thread.is_alive()]
+        self.assertEqual(alive, [])
 
     def env(self, fault=""):
         e = dict(os.environ,
@@ -983,7 +1060,7 @@ class KillTest(unittest.TestCase):
 
     def live_claim(self):
         p = subprocess.Popen(["sleep", "300"])
-        self.addCleanup(p.kill)
+        self._processes.append(p)
         st = vigil.proc_starttime(p.pid)
         claims = self.state / "claims"
         claims.mkdir(parents=True, exist_ok=True)
