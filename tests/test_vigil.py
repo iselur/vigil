@@ -17,14 +17,28 @@ from unittest import mock
 
 # Keep every direct import and grill-spawned unittest process away from the
 # user's real state/config, even when a test fails before restoring globals.
+_TEST_HOME_DIR = tempfile.TemporaryDirectory(prefix="vigil-suite-home-")
 _TEST_STATE_DIR = tempfile.TemporaryDirectory(prefix="vigil-suite-state-")
 _TEST_CONFIG_DIR = tempfile.TemporaryDirectory(prefix="vigil-suite-config-")
+_TEST_DEFAULT_STATE_DIR = Path(_TEST_HOME_DIR.name) / ".local" / "state" / "vigil"
+_TEST_DEFAULT_CONFIG_DIR = Path(_TEST_HOME_DIR.name) / ".config" / "vigil"
+_TEST_DEFAULT_STATE_DIR.mkdir(parents=True)
+_TEST_DEFAULT_CONFIG_DIR.mkdir(parents=True)
+_TEST_DEFAULT_STATE_SENTINEL = _TEST_DEFAULT_STATE_DIR / "claims" / "R136.json"
+_TEST_DEFAULT_STATE_SENTINEL.parent.mkdir(parents=True)
+_TEST_DEFAULT_STATE_SENTINEL.write_bytes(b'{"default-state":"sentinel"}\n')
+_TEST_DEFAULT_CONFIG_SENTINEL = _TEST_DEFAULT_CONFIG_DIR / "sentinel"
+_TEST_DEFAULT_CONFIG_SENTINEL.write_bytes(b"default-config-sentinel\n")
+os.environ["HOME"] = _TEST_HOME_DIR.name
 os.environ["VIGIL_STATE"] = _TEST_STATE_DIR.name
 os.environ["VIGIL_CONFIG"] = _TEST_CONFIG_DIR.name
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import vigil  # noqa: E402
+
+_IMPORTED_STATE = vigil.STATE
+_IMPORTED_CONFIG = vigil.CONFIG
 
 PY = sys.executable
 
@@ -245,21 +259,33 @@ class ClaimLockTests(unittest.TestCase):
             vigil.claim_lock_path("../escape")
 
     def test_claim_commands_leave_external_production_like_state_unchanged(self):
-        external = self.tmp / "production-like" / ".local" / "state" / "vigil"
-        external_claim = external / "claims" / (self.entry + ".json")
-        external_claim.parent.mkdir(parents=True)
-        external_claim.write_bytes(b'{"sentinel":"unchanged"}\n')
-        before = external_claim.read_bytes()
-        self.assertTrue(self.sandbox_state.is_relative_to(
+        default_state_before = _TEST_DEFAULT_STATE_SENTINEL.read_bytes()
+        default_config_before = _TEST_DEFAULT_CONFIG_SENTINEL.read_bytes()
+        self.assertTrue(Path(_IMPORTED_STATE).is_relative_to(
             Path(_TEST_STATE_DIR.name)))
-        self.assertEqual(vigil.cmd_claim([
-            self.entry, "--session", "native-2", "--vendor", "codex",
-            "--pid", str(self.pid)]), 0)
-        with mock.patch.object(vigil, "alert", return_value=True):
-            self.assertEqual(vigil.cmd_blocked([
-                self.entry, "owner ask", "--recommend", "continue",
-                "--by", "later"]), 0)
-        self.assertEqual(external_claim.read_bytes(), before)
+        self.assertTrue(Path(_IMPORTED_CONFIG).is_relative_to(
+            Path(_TEST_CONFIG_DIR.name)))
+        self.assertNotEqual(Path(_IMPORTED_STATE), _TEST_DEFAULT_STATE_DIR)
+        self.assertNotEqual(Path(_IMPORTED_CONFIG), _TEST_DEFAULT_CONFIG_DIR)
+
+        suite_claim = Path(_IMPORTED_STATE) / "claims" / (self.entry + ".json")
+        suite_claim.parent.mkdir(parents=True, exist_ok=True)
+        suite_claim.write_text(json.dumps(self.claim))
+        vigil.STATE = Path(_IMPORTED_STATE)
+        try:
+            self.assertEqual(vigil.cmd_claim([
+                self.entry, "--session", "native-2", "--vendor", "codex",
+                "--pid", str(self.pid)]), 0)
+            with mock.patch.object(vigil, "alert", return_value=True):
+                self.assertEqual(vigil.cmd_blocked([
+                    self.entry, "owner ask", "--recommend", "continue",
+                    "--by", "later"]), 0)
+        finally:
+            vigil.STATE = self.state
+        self.assertEqual(_TEST_DEFAULT_STATE_SENTINEL.read_bytes(),
+                         default_state_before)
+        self.assertEqual(_TEST_DEFAULT_CONFIG_SENTINEL.read_bytes(),
+                         default_config_before)
 
     def test_guard_exports_claim_and_propagates_child_exit(self):
         child = (
