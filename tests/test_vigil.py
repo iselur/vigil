@@ -943,7 +943,7 @@ class KillTest(unittest.TestCase):
             e.pop("VIGIL_FAULT", None)
         return e
 
-    def dead_claim(self):
+    def dead_claim(self, role="orchestrator"):
         """Claim pointing at a genuinely dead process generation."""
         p = subprocess.Popen(["sleep", "300"])
         st = vigil.proc_starttime(p.pid)
@@ -951,12 +951,14 @@ class KillTest(unittest.TestCase):
         p.wait()
         claims = self.state / "claims"
         claims.mkdir(parents=True, exist_ok=True)
-        (claims / "R900.json").write_text(json.dumps(
-            {"entry": "R900", "session": self.session, "vendor": "claude",
-             "pid": p.pid, "starttime": st, "generation": 1,
-             "policy": {"permission-mode": "bypassPermissions"},
-             "workdir": str(self.work),
-             "created": "x", "created_epoch": time.time() - 3600}))
+        claim = {"entry": "R900", "session": self.session, "vendor": "claude",
+                 "pid": p.pid, "starttime": st, "generation": 1,
+                 "policy": {"permission-mode": "bypassPermissions"},
+                 "workdir": str(self.work),
+                 "created": "x", "created_epoch": time.time() - 3600}
+        if role is not None:
+            claim["role"] = role
+        (claims / "R900.json").write_text(json.dumps(claim))
         return p.pid
 
     def check(self, fault=""):
@@ -1072,6 +1074,32 @@ class KillTest(unittest.TestCase):
         self.assertTrue(any("check itself failed" in b
                             for _, _, b in NtfyRecorder.posts))
 
+    def test_legacy_claude_claim_without_role_alerts_once_without_running_claude(self):
+        self.dead_claim(role=None)
+        called = self.tmp / "claude-called"
+        fake_claude = self.bins / "claude"
+        fake_claude.write_text(
+            "#!/bin/bash\n"
+            "touch %s\n"
+            "exit 1\n" % shlex.quote(str(called)))
+        fake_claude.chmod(0o755)
+        env = self.env()
+        env["VIGIL_HEARTBEAT_H"] = "0"
+
+        for _ in range(2):
+            r = subprocess.run([PY, str(ROOT / "vigil.py"), "check"], env=env,
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        self.assertFalse(called.exists())
+        self.assertFalse(self.argv_log.exists())
+        self.assertEqual(NtfyRecorder.posts, [
+            ("/topic", "R900: manual-only",
+             "R900 has a legacy Claude claim without role orchestrator. "
+             "Vigil will not probe or resume it; reclaim it explicitly before "
+             "automatic recovery.")
+        ])
+
     def test_lock_blocks_second_checker(self):
         self.dead_claim()
         self.state.mkdir(exist_ok=True)
@@ -1092,7 +1120,8 @@ class KillTest(unittest.TestCase):
         claims.mkdir(parents=True, exist_ok=True)
         (claims / "R900.json").write_text(json.dumps(
             {"entry": "R900", "session": self.session, "vendor": "claude",
-             "pid": p.pid, "starttime": st, "generation": 1, "policy": {},
+             "role": "orchestrator", "pid": p.pid, "starttime": st,
+             "generation": 1, "policy": {},
              "workdir": str(self.work),
              "created": "x", "created_epoch": time.time() - 3600}))
 
