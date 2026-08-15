@@ -194,7 +194,7 @@ def load_claim_strict(entry, session):
     if claim.get("vendor") not in ("claude", "codex"):
         raise ValueError("invalid claim vendor")
     if (not isinstance(claim.get("workdir"), str) or
-            not claim["workdir"] or
+            not claim["workdir"].strip() or
             isinstance(claim.get("generation"), bool) or
             not isinstance(claim.get("generation"), int) or
             claim["generation"] <= 0):
@@ -910,6 +910,9 @@ def cmd_claim(argv):
         return 2
     if not a.session.strip():
         print("vigil: invalid session", file=sys.stderr)
+        return 2
+    if a.workdir is not None and not a.workdir.strip():
+        print("vigil: invalid workdir", file=sys.stderr)
         return 2
     pid = a.pid or _find_agent_pid()
     if pid is None:
