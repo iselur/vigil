@@ -1096,8 +1096,8 @@ class KillTest(unittest.TestCase):
         self.assertEqual(NtfyRecorder.posts, [
             ("/topic", "R900: manual-only",
              "R900 has a legacy Claude claim without role orchestrator. "
-             "Vigil will not probe or resume it; reclaim it explicitly before "
-             "automatic recovery.")
+             "Vigil will not probe or resume it automatically; launch or "
+             "retire it manually.")
         ])
 
     def test_lock_blocks_second_checker(self):

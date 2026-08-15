@@ -39,6 +39,12 @@ MIN_FREE_KB = int(os.environ.get("VIGIL_MIN_FREE_KB", str(700 * 1024)))
 ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
 
 
+def auto_resume_allowed(claim):
+    """Legacy Claude claims require manual handling unless their role is explicit."""
+    return (claim.get("vendor") != "claude" or
+            claim.get("role") == "orchestrator")
+
+
 def fault(point):
     # crash-injection seam for the fault-injection suite
     if os.environ.get("VIGIL_FAULT") == point:
@@ -110,6 +116,8 @@ def codex_proc_liveness(session_id):
 
 def liveness(claim):
     """Combined tri-state. DEAD only when generation AND vendor signal agree."""
+    if not auto_resume_allowed(claim):
+        return DEAD
     gen = generation_alive(claim["pid"], claim["starttime"])
     if gen == ALIVE:
         return ALIVE
@@ -388,6 +396,8 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok, starts=None):
         claim = claims.get(entry)
         if claim is None:
             state = "unclaimed"
+        elif not auto_resume_allowed(claim):
+            state = "manual-only"
         elif now - claim.get("created_epoch", 0) < COLD_START_S:
             state = "healthy"  # cold-start grace: never act on a fresh claim
         else:
@@ -438,6 +448,10 @@ def _alert_text(entry, state, strikes):
     if state == "blocked":
         return ("%s is waiting on a decision from you — details were sent when "
                 "it blocked; `vigil status` shows the ask." % entry)
+    if state == "manual-only":
+        return ("%s has a legacy Claude claim without role orchestrator. "
+                "Vigil will not probe or resume it automatically; launch or "
+                "retire it manually." % entry)
     if state == "quarantined":
         return ("The session working on %s died %d times, so I've stopped "
                 "retrying. When you're ready: vigil reset %s"
@@ -618,6 +632,8 @@ def start_work(entry, workdir, starts):
 
 
 def recover(entry, claim, strikes):
+    if not auto_resume_allowed(claim):
+        return False
     attempt = uuid.uuid4().hex[:12]
     append_incident(event="intent", attempt=attempt, entry=entry,
                     strikes=strikes.get(entry, 0) + 1, session=claim["session"],
