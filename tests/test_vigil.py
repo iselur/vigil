@@ -1,5 +1,6 @@
 """vigil enforcement suite: decide() units, effect-level kill-test, fault injection."""
 
+import contextlib
 import http.server
 import json
 import os
@@ -242,12 +243,24 @@ class ClaimLockTests(unittest.TestCase):
                 except BaseException as exc:
                     errors.append(exc)
 
-            contender_thread = threading.Thread(target=contender)
-            contender_thread.start()
-            self.assertFalse(acquired.wait(.1))
-            release_child.write_text("yes")
-            worker.join(5)
-            contender_thread.join(5)
+            contender_reached = threading.Event()
+            real_flock = vigil.fcntl.flock
+
+            def flock(handle, operation):
+                if (operation == vigil.fcntl.LOCK_EX and
+                        threading.current_thread().name == "guard-contender"):
+                    contender_reached.set()
+                return real_flock(handle, operation)
+
+            contender_thread = threading.Thread(target=contender,
+                                                name="guard-contender")
+            with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+                contender_thread.start()
+                self.assertTrue(contender_reached.wait(5))
+                self.assertFalse(acquired.is_set())
+                release_child.write_text("yes")
+                worker.join(5)
+                contender_thread.join(5)
         self.assertEqual(errors, [])
         self.assertTrue(acquired.is_set())
 
@@ -277,40 +290,148 @@ class ClaimLockTests(unittest.TestCase):
                 "-c", "raise SystemExit(0)"],), 2)
 
     def test_transfer_first_refuses_former_session(self):
-        replacement = dict(self.claim, session="native-2", generation=2)
-        vigil.write_claim(self.entry, replacement)
+        before = self.claim_path.read_bytes()
+        result = vigil.cmd_claim([
+            self.entry, "--session", "native-2", "--vendor", "codex",
+            "--pid", str(self.pid)])
+        self.assertEqual(result, 0)
+        transferred = self.claim_path.read_bytes()
+        self.assertNotEqual(transferred, before)
         with mock.patch.object(vigil, "_find_agent_process",
                                return_value=(self.pid, self.starttime, "codex")):
             self.assertEqual(vigil.cmd_guard([
                 self.entry, "--session", "native-1", "--", sys.executable,
                 "-c", "raise SystemExit(0)"],), 2)
+        self.assertEqual(self.claim_path.read_bytes(), transferred)
 
-    def test_claim_writer_waits_for_the_same_entry_lock(self):
-        entered = threading.Event()
+    def test_guard_wins_then_real_claim_transfer_waits(self):
+        started = self.tmp / "guard-started"
+        release_guard = self.tmp / "release-guard"
+        child = (
+            "import pathlib,time; marker=pathlib.Path(%r); marker.write_text('yes'); "
+            "release=pathlib.Path(%r); exec(\"while not release.exists():\\n "
+            "time.sleep(.01)\")"
+        ) % (str(started), str(release_guard))
+        guard_result = []
+        transfer_result = []
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "codex")):
+            guard = threading.Thread(
+                target=lambda: guard_result.append(vigil.cmd_guard([
+                    self.entry, "--session", "native-1", "--", sys.executable,
+                    "-c", child]),), name="guard-consumer")
+            guard.start()
+            for _ in range(500):
+                if started.exists():
+                    break
+                time.sleep(.01)
+            self.assertTrue(started.exists())
+            transfer_reached = threading.Event()
+            real_flock = vigil.fcntl.flock
+
+            def flock(handle, operation):
+                if (operation == vigil.fcntl.LOCK_EX and
+                        threading.current_thread().name == "real-transfer"):
+                    transfer_reached.set()
+                return real_flock(handle, operation)
+
+            def transfer():
+                transfer_result.append(vigil.cmd_claim([
+                    self.entry, "--session", "native-2", "--vendor", "codex",
+                    "--pid", str(self.pid)]))
+
+            with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+                writer = threading.Thread(target=transfer, name="real-transfer")
+                writer.start()
+                self.assertTrue(transfer_reached.wait(5))
+                self.assertEqual(json.loads(self.claim_path.read_text())["session"],
+                                 "native-1")
+                release_guard.write_text("yes")
+                guard.join(5)
+                writer.join(5)
+        self.assertEqual(guard_result, [0])
+        self.assertEqual(transfer_result, [0])
+        self.assertEqual(json.loads(self.claim_path.read_text())["session"],
+                         "native-2")
+
+    def recovery_patches(self):
+        return (
+            mock.patch.object(vigil, "preflight", return_value=True),
+            mock.patch.object(vigil, "alert", return_value=True),
+            mock.patch.object(vigil, "resume_argv", return_value=["resume"]),
+            mock.patch.object(vigil, "find_resumed",
+                              return_value=(self.pid, self.starttime)),
+            mock.patch.object(vigil.subprocess, "run"),
+        )
+
+    def test_recovery_transfer_first_refuses_without_overwrite(self):
+        old_bytes = self.claim_path.read_bytes()
+        with contextlib.ExitStack() as stack:
+            for patcher in self.recovery_patches():
+                stack.enter_context(patcher)
+            self.assertEqual(vigil.cmd_claim([
+                self.entry, "--session", "native-2", "--vendor", "codex",
+                "--pid", str(self.pid)]), 0)
+            transferred = self.claim_path.read_bytes()
+            self.assertFalse(vigil.recover(self.entry, dict(self.claim), {}))
+        self.assertNotEqual(transferred, old_bytes)
+        self.assertEqual(self.claim_path.read_bytes(), transferred)
+        self.assertIn("note=commit:claim-changed",
+                      (self.state / "incidents.log").read_text())
+
+    def test_recovery_wins_then_transfer_waits_and_preserves_both_commits(self):
+        reached = threading.Event()
         release = threading.Event()
+        transfer_reached = threading.Event()
+        recovery_result = []
+        transfer_result = []
+        real_write_json = vigil.write_json
+        real_flock = vigil.fcntl.flock
 
-        def replace():
-            with vigil.entry_lock(self.entry):
-                entered.set()
-                release.wait(5)
+        def write_json(path, obj):
+            if (Path(path) == self.claim_path and
+                    threading.current_thread().name == "recovery"):
+                reached.set()
+                if not release.wait(5):
+                    raise AssertionError("recovery write barrier timed out")
+            return real_write_json(path, obj)
 
-        holder = threading.Thread(target=replace)
-        holder.start()
-        self.assertTrue(entered.wait(5))
-        done = threading.Event()
+        def flock(handle, operation):
+            if (operation == vigil.fcntl.LOCK_EX and
+                    threading.current_thread().name == "recovery-transfer"):
+                transfer_reached.set()
+            return real_flock(handle, operation)
 
-        def writer():
-            vigil.write_claim(self.entry, dict(self.claim, generation=2))
-            done.set()
+        def recover():
+            with contextlib.ExitStack() as stack:
+                for patcher in self.recovery_patches():
+                    stack.enter_context(patcher)
+                recovery_result.append(vigil.recover(
+                    self.entry, dict(self.claim), {}))
 
-        worker = threading.Thread(target=writer)
-        worker.start()
-        self.assertFalse(done.wait(0.1))
-        release.set()
-        worker.join(5)
-        holder.join(5)
-        self.assertTrue(done.is_set())
-        self.assertEqual(json.loads(self.claim_path.read_text())["generation"], 2)
+        def transfer():
+            transfer_result.append(vigil.cmd_claim([
+                self.entry, "--session", "native-2", "--vendor", "codex",
+                "--pid", str(self.pid)]))
+
+        with mock.patch.object(vigil, "write_json", side_effect=write_json), \
+                mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+            recovery = threading.Thread(target=recover, name="recovery")
+            recovery.start()
+            self.assertTrue(reached.wait(5))
+            writer = threading.Thread(target=transfer, name="recovery-transfer")
+            writer.start()
+            self.assertTrue(transfer_reached.wait(5))
+            self.assertEqual(json.loads(self.claim_path.read_text())["session"],
+                             "native-1")
+            release.set()
+            recovery.join(5)
+            writer.join(5)
+        self.assertEqual(recovery_result, [True])
+        self.assertEqual(transfer_result, [0])
+        final = json.loads(self.claim_path.read_text())
+        self.assertEqual(final["session"], "native-2")
+        self.assertEqual(final["generation"], 3)
 
     def _assert_writer_waits(self, writer):
         entered = threading.Event()
@@ -321,10 +442,11 @@ class ClaimLockTests(unittest.TestCase):
                 entered.set()
                 release.wait(5)
 
-        holder = threading.Thread(target=hold)
+        holder = threading.Thread(target=hold, name="lock-holder")
         holder.start()
         self.assertTrue(entered.wait(5))
         finished = threading.Event()
+        writer_reached = threading.Event()
         errors = []
 
         def run():
@@ -335,12 +457,22 @@ class ClaimLockTests(unittest.TestCase):
             finally:
                 finished.set()
 
-        worker = threading.Thread(target=run)
-        worker.start()
-        self.assertFalse(finished.wait(0.1))
-        release.set()
-        worker.join(5)
-        holder.join(5)
+        real_flock = vigil.fcntl.flock
+
+        def flock(handle, operation):
+            if (operation == vigil.fcntl.LOCK_EX and
+                    threading.current_thread().name == "lock-writer"):
+                writer_reached.set()
+            return real_flock(handle, operation)
+
+        worker = threading.Thread(target=run, name="lock-writer")
+        with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+            worker.start()
+            self.assertTrue(writer_reached.wait(5))
+            self.assertFalse(finished.is_set())
+            release.set()
+            worker.join(5)
+            holder.join(5)
         self.assertTrue(finished.is_set())
         self.assertEqual(errors, [])
 
@@ -353,6 +485,7 @@ class ClaimLockTests(unittest.TestCase):
                 self.entry, "owner ask", "--recommend", "continue", "--by", "later"]))
             self._assert_writer_waits(lambda: vigil.cmd_blocked([
                 self.entry, "--clear"]))
+        vigil.write_claim(self.entry, dict(self.claim))
         with mock.patch.object(vigil, "preflight", return_value=True), \
                 mock.patch.object(vigil, "alert", return_value=True), \
                 mock.patch.object(vigil, "resume_argv", return_value=["resume"]), \

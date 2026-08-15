@@ -24,7 +24,7 @@ MUTANTS = [
     ("strike budget boundary", ">= MAX_STRIKES", "> MAX_STRIKES"),
     ("alive inverted", "if lv == ALIVE:", "if lv != ALIVE:"),
     ("alert dedupe deleted",
-     'if state != notified.get(entry, "healthy") and state != "healthy":',
+     'if state != notified.get(entry, "healthy") and state != "healthy" and not quiet:',
      'if state != "healthy":'),
     ("one-recovery cap deleted",
      'if state == "orphaned" and recover is None:',

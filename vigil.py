@@ -631,11 +631,19 @@ def recover(entry, claim, strikes):
                         note="verify:process-not-found")
         return False
     pid, st = found
-    newclaim = dict(claim, pid=pid, starttime=st,
-                    generation=claim.get("generation", 1) + 1,
-                    created=now_iso(), created_epoch=time.time())
     fault("pre-commit")
-    write_claim(entry, newclaim)
+    with entry_lock(entry):
+        current = read_json(claim_path(entry), None)
+        identity = ("entry", "session", "vendor", "pid", "starttime", "generation")
+        if (not isinstance(current, dict) or
+                any(current.get(key) != claim.get(key) for key in identity)):
+            append_incident(event="fail", attempt=attempt, entry=entry,
+                            note="commit:claim-changed")
+            return False
+        newclaim = dict(current, pid=pid, starttime=st,
+                        generation=current.get("generation", 1) + 1,
+                        created=now_iso(), created_epoch=time.time())
+        write_json(claim_path(entry), newclaim)
     append_incident(event="commit", attempt=attempt, entry=entry, pid=pid,
                     starttime=st, generation=newclaim["generation"])
     return True
@@ -864,7 +872,7 @@ def cmd_claim(argv):
     ap.add_argument("--policy", action="append", default=[],
                     help="k=v, e.g. permission-mode=bypassPermissions")
     a = ap.parse_args(argv)
-    if not ENTRY_RE.match(a.entry):
+    if not ENTRY_RE.fullmatch(a.entry):
         print("vigil: invalid entry id", file=sys.stderr)
         return 2
     pid = a.pid or _find_agent_pid()
