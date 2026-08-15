@@ -11,7 +11,10 @@ One Python file, stdlib only. One hourly timer. No daemon.
 
 - **Claim**: a session takes a work entry with `vigil claim R122 --session <id> --vendor
   claude` — recording pid + `/proc` start-time (exact process generation, immune to PID
-  reuse) and its launch policy, which a resume replays verbatim (never elevated).
+  reuse) and its launch policy, which a resume replays verbatim (never elevated). Claim
+  replacements are serialized by a private per-entry sidecar lock. A continuity consumer
+  can use `vigil guard R122 --session <id> -- <command>` to receive the locked canonical
+  claim as `VIGIL_CLAIM_JSON` until the command exits.
 - **Check** (hourly + on session start): level-triggered — re-derives the world from
   files and acts on the diff. Death requires the process generation AND the vendor
   signal (`claude agents --json` / codex proc scan) to agree; observation failure is
@@ -35,7 +38,7 @@ One Python file, stdlib only. One hourly timer. No daemon.
 
 ## Commands
 
-    vigil check | selfcheck | claim | beat | blocked | ask | reset | vendor | status
+    vigil check | selfcheck | claim | guard | beat | blocked | ask | reset | vendor | status
 
 ## Enforcement
 

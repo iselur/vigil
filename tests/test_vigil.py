@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -157,6 +158,213 @@ class StartArgvTests(unittest.TestCase):
         self.assertIn(vigil.CLAUDE_BIN, argv)
         self.assertIn("--vendor claude", argv[-1])
         self.assertNotIn(vigil.CODEX_BIN, argv[8:-1])
+
+
+class ClaimLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vigil-lock-test-"))
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.old_state = vigil.STATE
+        vigil.STATE = self.state
+        self.entry = "R136"
+        self.pid = os.getpid()
+        self.starttime = vigil.proc_starttime(self.pid)
+        self.claim = {
+            "entry": self.entry, "session": "native-1", "vendor": "codex",
+            "pid": self.pid, "starttime": self.starttime, "generation": 1,
+            "policy": {}, "workdir": str(self.tmp), "created": "x",
+            "created_epoch": time.time(),
+        }
+        self.env = dict(os.environ, VIGIL_STATE=str(self.state))
+        self.claim_path = self.state / "claims" / (self.entry + ".json")
+        self.claim_path.parent.mkdir()
+        self.claim_path.write_text(json.dumps(self.claim))
+
+    def tearDown(self):
+        vigil.STATE = self.old_state
+        for path in self.state.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        for path in sorted(self.state.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.rmdir()
+        self.state.rmdir()
+
+    def test_entry_lock_is_stable_and_validated(self):
+        with vigil.entry_lock(self.entry):
+            lock = self.state / "claim-locks" / (self.entry + ".lock")
+            self.assertTrue(lock.is_file())
+            self.assertEqual(vigil.claim_lock_path(self.entry), lock)
+        with self.assertRaises(ValueError):
+            vigil.claim_lock_path("../escape")
+
+    def test_guard_exports_claim_and_propagates_child_exit(self):
+        child = (
+            "import json,os,sys; value=json.loads(os.environ['VIGIL_CLAIM_JSON']); "
+            "assert list(value) == sorted(value); assert value['entry']=='R136'; "
+            "assert value['session']=='native-1'; sys.exit(23)"
+        )
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "codex")):
+            code = vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", child,
+            ])
+        self.assertEqual(code, 23)
+
+    def test_guard_holds_entry_lock_until_child_exit(self):
+        started = self.tmp / "child-started"
+        release_child = self.tmp / "release-child"
+        child = (
+            "import pathlib,time; marker=pathlib.Path(%r); marker.write_text('yes'); "
+            "release=pathlib.Path(%r); exec(\"while not release.exists():\\n "
+            "time.sleep(.01)\")"
+        ) % (str(started), str(release_child))
+        errors = []
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "codex")):
+            worker = threading.Thread(target=lambda: vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", child]))
+            worker.start()
+            for _ in range(500):
+                if started.exists():
+                    break
+                time.sleep(.01)
+            self.assertTrue(started.exists())
+            acquired = threading.Event()
+
+            def contender():
+                try:
+                    with vigil.entry_lock(self.entry):
+                        acquired.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            contender_thread = threading.Thread(target=contender)
+            contender_thread.start()
+            self.assertFalse(acquired.wait(.1))
+            release_child.write_text("yes")
+            worker.join(5)
+            contender_thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertTrue(acquired.is_set())
+
+    def test_guard_refuses_session_and_process_generation_mismatch(self):
+        for actor in (
+            (self.pid, self.starttime, "codex"),
+            (self.pid, self.starttime, "claude"),
+        ):
+            with mock.patch.object(vigil, "_find_agent_process", return_value=actor):
+                self.assertEqual(vigil.cmd_guard([
+                    self.entry, "--session", "wrong", "--", sys.executable,
+                    "-c", "raise SystemExit(0)"],), 2)
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid + 1, self.starttime, "codex")):
+            self.assertEqual(vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", "raise SystemExit(0)"],), 2)
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime + 1, "codex")):
+            self.assertEqual(vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", "raise SystemExit(0)"],), 2)
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "claude")):
+            self.assertEqual(vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", "raise SystemExit(0)"],), 2)
+
+    def test_transfer_first_refuses_former_session(self):
+        replacement = dict(self.claim, session="native-2", generation=2)
+        vigil.write_claim(self.entry, replacement)
+        with mock.patch.object(vigil, "_find_agent_process",
+                               return_value=(self.pid, self.starttime, "codex")):
+            self.assertEqual(vigil.cmd_guard([
+                self.entry, "--session", "native-1", "--", sys.executable,
+                "-c", "raise SystemExit(0)"],), 2)
+
+    def test_claim_writer_waits_for_the_same_entry_lock(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def replace():
+            with vigil.entry_lock(self.entry):
+                entered.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=replace)
+        holder.start()
+        self.assertTrue(entered.wait(5))
+        done = threading.Event()
+
+        def writer():
+            vigil.write_claim(self.entry, dict(self.claim, generation=2))
+            done.set()
+
+        worker = threading.Thread(target=writer)
+        worker.start()
+        self.assertFalse(done.wait(0.1))
+        release.set()
+        worker.join(5)
+        holder.join(5)
+        self.assertTrue(done.is_set())
+        self.assertEqual(json.loads(self.claim_path.read_text())["generation"], 2)
+
+    def _assert_writer_waits(self, writer):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with vigil.entry_lock(self.entry):
+                entered.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(entered.wait(5))
+        finished = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                writer()
+            except BaseException as exc:  # surface writer failures below
+                errors.append(exc)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertFalse(finished.wait(0.1))
+        release.set()
+        worker.join(5)
+        holder.join(5)
+        self.assertTrue(finished.is_set())
+        self.assertEqual(errors, [])
+
+    def test_each_claim_content_writer_waits_on_the_entry_lock(self):
+        self._assert_writer_waits(lambda: vigil.cmd_claim([
+            self.entry, "--session", "native-2", "--vendor", "codex",
+            "--pid", str(self.pid)]))
+        with mock.patch.object(vigil, "alert", return_value=True):
+            self._assert_writer_waits(lambda: vigil.cmd_blocked([
+                self.entry, "owner ask", "--recommend", "continue", "--by", "later"]))
+            self._assert_writer_waits(lambda: vigil.cmd_blocked([
+                self.entry, "--clear"]))
+        with mock.patch.object(vigil, "preflight", return_value=True), \
+                mock.patch.object(vigil, "alert", return_value=True), \
+                mock.patch.object(vigil, "resume_argv", return_value=["resume"]), \
+                mock.patch.object(vigil, "find_resumed",
+                                  return_value=(self.pid, self.starttime)), \
+                mock.patch.object(vigil.subprocess, "run"):
+            self._assert_writer_waits(lambda: vigil.recover(
+                self.entry, dict(self.claim), {}))
+        vigil.append_incident(event="intent", attempt="dangling", entry=self.entry)
+        with mock.patch.object(vigil, "find_resumed",
+                               return_value=(self.pid, self.starttime)):
+            self._assert_writer_waits(vigil.reconcile)
 
 
 class LedgerParseTests(unittest.TestCase):
