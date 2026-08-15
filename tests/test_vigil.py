@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -289,6 +290,45 @@ class ClaimLockTests(unittest.TestCase):
                 self.entry, "--session", "native-1", "--", sys.executable,
                 "-c", "raise SystemExit(0)"],), 2)
 
+    def test_guard_refuses_missing_workdir_and_nonpositive_generation(self):
+        for field, value in (("workdir", ""), ("generation", 0)):
+            claim = dict(self.claim, **{field: value})
+            self.claim_path.write_text(json.dumps(claim))
+            with mock.patch.object(vigil, "_find_agent_process",
+                                   return_value=(self.pid, self.starttime, "codex")):
+                self.assertEqual(vigil.cmd_guard([
+                    self.entry, "--session", "native-1", "--", sys.executable,
+                    "-c", "raise SystemExit(0)"],), 2)
+            self.claim_path.write_text(json.dumps(self.claim))
+
+    def test_agent_ancestry_uses_exact_argv0_vendor_processes(self):
+        probe = ("import vigil; found=vigil._find_agent_process(); "
+                 "print(found[2] if found else 'none')")
+        for vendor in ("codex", "claude"):
+            exact = "exec -a %s bash -c %s" % (
+                vendor, shlex.quote("python3 -c %s & wait" % shlex.quote(probe)))
+            exact_result = subprocess.run(["bash", "-c", exact],
+                                           env=dict(os.environ, PYTHONPATH=str(ROOT)),
+                                           capture_output=True, text=True, check=True)
+            self.assertEqual(exact_result.stdout.strip(), vendor)
+            wrapper = ["/bin/sh", "--vendor=%s" % vendor]
+            self.assertIsNone(vigil._agent_vendor(wrapper))
+            proc_probe = (
+                "import os,pathlib,vigil; argv=pathlib.Path(f'/proc/{os.getppid()}/cmdline') "
+                ".read_bytes().decode().split('\\0'); "
+                "print(vigil._agent_vendor(argv) or 'none')"
+            )
+            wrapper = "exec -a wrapper bash -c %s %s" % (
+                shlex.quote("python3 -c %s & wait" % shlex.quote(proc_probe)),
+                vendor)
+            wrapper_result = subprocess.run(
+                ["bash", "-c", wrapper],
+                env=dict(os.environ, PYTHONPATH=str(ROOT)),
+                capture_output=True, text=True, check=True)
+            self.assertEqual(wrapper_result.stdout.strip(), "none")
+        self.assertIsNone(vigil._agent_vendor(["/bin/sh", "codex"]))
+        self.assertEqual(vigil._agent_vendor(["/opt/codex"]), "codex")
+
     def test_transfer_first_refuses_former_session(self):
         before = self.claim_path.read_bytes()
         result = vigil.cmd_claim([
@@ -353,6 +393,92 @@ class ClaimLockTests(unittest.TestCase):
         self.assertEqual(transfer_result, [0])
         self.assertEqual(json.loads(self.claim_path.read_text())["session"],
                          "native-2")
+
+    def test_guard_transfer_matrix_both_orders_and_generations(self):
+        cases = (
+            ("codex", "claude", "codex-session", "claude-session"),
+            ("claude", "codex", "claude-session", "codex-session"),
+            ("codex", "codex", "same-session", "same-session"),
+        )
+        for n, (old_vendor, new_vendor, old_session, new_session) in enumerate(cases):
+            old_proc = subprocess.Popen(["sleep", "30"])
+            new_proc = subprocess.Popen(["sleep", "30"])
+            self.addCleanup(lambda p: (p.kill(), p.wait()), old_proc)
+            self.addCleanup(lambda p: (p.kill(), p.wait()), new_proc)
+            old_start = vigil.proc_starttime(old_proc.pid)
+            new_start = vigil.proc_starttime(new_proc.pid)
+            old_claim = dict(self.claim, vendor=old_vendor, session=old_session,
+                             pid=old_proc.pid, starttime=old_start, generation=1)
+            self.claim_path.write_text(json.dumps(old_claim))
+
+            # Transfer-first: the former live process is refused and the new
+            # claim remains byte-identical after the refusal.
+            self.assertEqual(vigil.cmd_claim([
+                self.entry, "--session", new_session, "--vendor", new_vendor,
+                "--pid", str(new_proc.pid)]), 0)
+            transferred = self.claim_path.read_bytes()
+            with mock.patch.object(vigil, "_find_agent_process",
+                                   return_value=(old_proc.pid, old_start, old_vendor)):
+                self.assertEqual(vigil.cmd_guard([
+                    self.entry, "--session", old_session, "--", sys.executable,
+                    "-c", "raise SystemExit(0)"],), 2)
+            self.assertEqual(self.claim_path.read_bytes(), transferred)
+            self.assertEqual(json.loads(transferred)["generation"], 2)
+
+            # Mutation-first: the old guard owns the lock, then a real claim
+            # transfer reaches and waits on that same lock until child exit.
+            self.claim_path.write_text(json.dumps(old_claim))
+            started = self.tmp / ("matrix-started-%d" % n)
+            release = self.tmp / ("matrix-release-%d" % n)
+            child = (
+                "import pathlib,time; pathlib.Path(%r).write_text('yes'); "
+                "r=pathlib.Path(%r); exec(\"while not r.exists():\\n "
+                "time.sleep(.01)\")"
+            ) % (str(started), str(release))
+            guard_result = []
+            transfer_result = []
+            with mock.patch.object(vigil, "_find_agent_process",
+                                   return_value=(old_proc.pid, old_start, old_vendor)):
+                guard = threading.Thread(target=lambda: guard_result.append(
+                    vigil.cmd_guard([
+                        self.entry, "--session", old_session, "--", sys.executable,
+                        "-c", child])), name="matrix-guard-%d" % n)
+                guard.start()
+                for _ in range(500):
+                    if started.exists():
+                        break
+                    time.sleep(.01)
+                self.assertTrue(started.exists())
+                transfer_reached = threading.Event()
+                real_flock = vigil.fcntl.flock
+
+                def flock(handle, operation):
+                    if (operation == vigil.fcntl.LOCK_EX and
+                            threading.current_thread().name == "matrix-transfer-%d" % n):
+                        transfer_reached.set()
+                    return real_flock(handle, operation)
+
+                def transfer():
+                    transfer_result.append(vigil.cmd_claim([
+                        self.entry, "--session", new_session, "--vendor", new_vendor,
+                        "--pid", str(new_proc.pid)]))
+
+                with mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+                    writer = threading.Thread(target=transfer,
+                                              name="matrix-transfer-%d" % n)
+                    writer.start()
+                    self.assertTrue(transfer_reached.wait(5))
+                    self.assertEqual(json.loads(self.claim_path.read_text())["session"],
+                                     old_session)
+                    release.write_text("yes")
+                    guard.join(5)
+                    writer.join(5)
+            self.assertEqual(guard_result, [0])
+            self.assertEqual(transfer_result, [0])
+            final = json.loads(self.claim_path.read_text())
+            self.assertEqual(final["session"], new_session)
+            self.assertEqual(final["vendor"], new_vendor)
+            self.assertEqual(final["generation"], 2)
 
     def recovery_patches(self):
         return (
@@ -433,6 +559,78 @@ class ClaimLockTests(unittest.TestCase):
         self.assertEqual(final["session"], "native-2")
         self.assertEqual(final["generation"], 3)
 
+    def append_dangling_intent(self, attempt="dangling"):
+        vigil.append_incident(
+            event="intent", attempt=attempt, entry=self.entry,
+            session=self.claim["session"], vendor=self.claim["vendor"],
+            pid=self.claim["pid"], starttime=self.claim["starttime"],
+            generation=self.claim["generation"])
+
+    def test_dangling_reconcile_transfer_first_refuses_without_overwrite(self):
+        self.append_dangling_intent()
+        self.assertEqual(vigil.cmd_claim([
+            self.entry, "--session", "native-2", "--vendor", "codex",
+            "--pid", str(self.pid)]), 0)
+        transferred = self.claim_path.read_bytes()
+        with mock.patch.object(vigil, "find_resumed",
+                               side_effect=AssertionError("stale reconcile searched")):
+            vigil.reconcile()
+        self.assertEqual(self.claim_path.read_bytes(), transferred)
+        self.assertIn("note=reconciled:claim-identity-mismatch",
+                      (self.state / "incidents.log").read_text())
+
+    def test_dangling_reconcile_wins_then_transfer_waits(self):
+        self.append_dangling_intent()
+        found_reached = threading.Event()
+        release_found = threading.Event()
+        transfer_reached = threading.Event()
+        transfer_result = []
+        real_flock = vigil.fcntl.flock
+
+        def find_resumed(claim, deadline_s=1):
+            found_reached.set()
+            if not release_found.wait(5):
+                raise AssertionError("reconcile find barrier timed out")
+            return self.pid, self.starttime
+
+        def flock(handle, operation):
+            if (operation == vigil.fcntl.LOCK_EX and
+                    threading.current_thread().name == "dangling-transfer"):
+                transfer_reached.set()
+            return real_flock(handle, operation)
+
+        def transfer():
+            transfer_result.append(vigil.cmd_claim([
+                self.entry, "--session", "native-2", "--vendor", "codex",
+                "--pid", str(self.pid)]))
+
+        with mock.patch.object(vigil, "find_resumed", side_effect=find_resumed), \
+                mock.patch.object(vigil.fcntl, "flock", side_effect=flock):
+            reconcile = threading.Thread(target=vigil.reconcile, name="dangling-reconcile")
+            reconcile.start()
+            self.assertTrue(found_reached.wait(5))
+            writer = threading.Thread(target=transfer, name="dangling-transfer")
+            writer.start()
+            self.assertTrue(transfer_reached.wait(5))
+            self.assertEqual(json.loads(self.claim_path.read_text())["session"],
+                             "native-1")
+            release_found.set()
+            reconcile.join(5)
+            writer.join(5)
+        self.assertEqual(transfer_result, [0])
+        final = json.loads(self.claim_path.read_text())
+        self.assertEqual(final["session"], "native-2")
+        self.assertEqual(final["generation"], 3)
+
+    def test_dangling_legacy_intent_fails_closed(self):
+        vigil.append_incident(event="intent", attempt="legacy", entry=self.entry,
+                              session=self.claim["session"], vendor=self.claim["vendor"])
+        before = self.claim_path.read_bytes()
+        vigil.reconcile()
+        self.assertEqual(self.claim_path.read_bytes(), before)
+        self.assertIn("note=reconciled:claim-identity-mismatch",
+                      (self.state / "incidents.log").read_text())
+
     def _assert_writer_waits(self, writer):
         entered = threading.Event()
         release = threading.Event()
@@ -485,7 +683,9 @@ class ClaimLockTests(unittest.TestCase):
                 self.entry, "owner ask", "--recommend", "continue", "--by", "later"]))
             self._assert_writer_waits(lambda: vigil.cmd_blocked([
                 self.entry, "--clear"]))
-        vigil.write_claim(self.entry, dict(self.claim))
+        self.assertEqual(vigil.cmd_claim([
+            self.entry, "--session", "native-1", "--vendor", "codex",
+            "--pid", str(self.pid)]), 0)
         with mock.patch.object(vigil, "preflight", return_value=True), \
                 mock.patch.object(vigil, "alert", return_value=True), \
                 mock.patch.object(vigil, "resume_argv", return_value=["resume"]), \

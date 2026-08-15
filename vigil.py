@@ -164,7 +164,7 @@ def entry_lock(entry):
     with os.fdopen(fd, "r+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
-            yield handle
+            yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
@@ -173,12 +173,6 @@ def claim_path(entry):
     if not isinstance(entry, str) or not ENTRY_RE.fullmatch(entry):
         raise ValueError("invalid entry id")
     return claims_dir() / (entry + ".json")
-
-
-def write_claim(entry, claim):
-    """Replace a claim while holding its entry lock."""
-    with entry_lock(entry):
-        write_json(claim_path(entry), claim)
 
 
 def load_claim_strict(entry, session):
@@ -196,6 +190,12 @@ def load_claim_strict(entry, session):
         raise ValueError("claim session mismatch")
     if claim.get("vendor") not in ("claude", "codex"):
         raise ValueError("invalid claim vendor")
+    if (not isinstance(claim.get("workdir"), str) or
+            not claim["workdir"] or
+            isinstance(claim.get("generation"), bool) or
+            not isinstance(claim.get("generation"), int) or
+            claim["generation"] <= 0):
+        raise ValueError("invalid claim identity")
     pid = claim.get("pid")
     starttime = claim.get("starttime")
     if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or
@@ -203,6 +203,25 @@ def load_claim_strict(entry, session):
             starttime < 0 or proc_starttime(pid) != starttime):
         raise ValueError("claim process generation mismatch")
     return claim
+
+
+CLAIM_IDENTITY_FIELDS = ("entry", "session", "vendor", "pid", "starttime",
+                         "generation")
+
+
+def claim_identity_matches(left, right):
+    return (isinstance(left, dict) and isinstance(right, dict) and
+            all(left.get(key) == right.get(key)
+                for key in CLAIM_IDENTITY_FIELDS))
+
+
+def intent_identity_matches(claim, intent):
+    if not isinstance(claim, dict):
+        return False
+    if any(not intent.get(key) for key in CLAIM_IDENTITY_FIELDS):
+        return False
+    return all(str(claim.get(key)) == intent.get(key)
+               for key in CLAIM_IDENTITY_FIELDS)
 
 
 def claims_dir():
@@ -599,7 +618,8 @@ def recover(entry, claim, strikes):
     attempt = uuid.uuid4().hex[:12]
     append_incident(event="intent", attempt=attempt, entry=entry,
                     strikes=strikes.get(entry, 0) + 1, session=claim["session"],
-                    vendor=claim["vendor"])
+                    vendor=claim["vendor"], pid=claim["pid"],
+                    starttime=claim["starttime"], generation=claim["generation"])
     fault("post-intent")
     if not preflight(claim):
         append_incident(event="fail", attempt=attempt, entry=entry,
@@ -634,9 +654,7 @@ def recover(entry, claim, strikes):
     fault("pre-commit")
     with entry_lock(entry):
         current = read_json(claim_path(entry), None)
-        identity = ("entry", "session", "vendor", "pid", "starttime", "generation")
-        if (not isinstance(current, dict) or
-                any(current.get(key) != claim.get(key) for key in identity)):
+        if not claim_identity_matches(current, claim):
             append_incident(event="fail", attempt=attempt, entry=entry,
                             note="commit:claim-changed")
             return False
@@ -660,6 +678,10 @@ def reconcile():
             continue
         with entry_lock(entry):
             claim = read_json(claim_path(entry), None)
+            if not intent_identity_matches(claim, kv):
+                append_incident(event="fail", attempt=attempt, entry=entry,
+                                note="reconciled:claim-identity-mismatch")
+                continue
             found = find_resumed(claim, deadline_s=1) if claim else None
             if found:
                 pid, st = found
@@ -788,6 +810,17 @@ def cmd_selfcheck():
     return 0
 
 
+def _agent_vendor(argv):
+    if not argv or not argv[0]:
+        return None
+    base = os.path.basename(argv[0])
+    if base in ("claude", "claude.exe"):
+        return "claude"
+    if base in ("codex", "codex.exe"):
+        return "codex"
+    return None
+
+
 def _find_agent_process():
     pid = os.getppid()
     for _ in range(15):
@@ -798,12 +831,9 @@ def _find_agent_process():
                 "utf-8", "replace").split("\0")
         except OSError:
             break
-        base = os.path.basename(argv[0]) if argv and argv[0] else ""
-        joined = " ".join(argv)
-        if "claude" in base or "/claude" in joined:
-            return pid, proc_starttime(pid), "claude"
-        if "codex" in base or "codex" in joined:
-            return pid, proc_starttime(pid), "codex"
+        vendor = _agent_vendor(argv)
+        if vendor:
+            return pid, proc_starttime(pid), vendor
         try:
             stat = Path("/proc/%d/stat" % pid).read_text()
             pid = int(stat.rsplit(")", 1)[1].split()[1])
