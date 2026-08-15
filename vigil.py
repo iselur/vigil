@@ -32,6 +32,7 @@ ENTRY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 COLD_START_S = 300
 CYCLE_S = 3600
 MAX_STRIKES = 2
+MAX_STARTS = 2   # attempts to START work on a row nobody ever claimed
 MIN_FREE_KB = int(os.environ.get("VIGIL_MIN_FREE_KB", str(700 * 1024)))
 
 ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
@@ -282,7 +283,7 @@ def replay_pending_alerts():
 
 # ---------- the pure decision core (mutation-campaign target) ----------
 
-def decide(entries, claims, live, strikes, notified, now, mem_ok):
+def decide(entries, claims, live, strikes, notified, now, mem_ok, starts=None):
     """Pure. No I/O.
 
     entries: [entry_id]                     claims: {entry: claim_dict}
@@ -294,7 +295,9 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok):
              "recover": entry_or_None, "notified": new_notified}
     """
     states, alerts = {}, []
+    starts = starts or {}
     recover = None
+    start = None
     new_notified = dict(notified)
     for entry in sorted(entries):
         claim = claims.get(entry)
@@ -313,12 +316,19 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok):
             else:
                 state = "orphaned"
         states[entry] = state
-        if state != notified.get(entry, "healthy") and state != "healthy":
+        quiet = state == "unclaimed" and starts.get(entry, 0) < MAX_STARTS
+        if state != notified.get(entry, "healthy") and state != "healthy" and not quiet:
             alerts.append((entry, state, _alert_text(entry, state, strikes)))
-        if state == "healthy":
+        if state == "healthy" or quiet:
             new_notified.pop(entry, None)
         else:
             new_notified[entry] = state
+        # An unclaimed row is work nobody ever picked up. Reporting it to the owner asks
+        # him to be the scheduler; vigil already knows how to launch a session, it just had
+        # no verb for "never claimed" — only "claimed, then died". Start it.
+        if state == "unclaimed" and start is None and mem_ok:
+            if starts.get(entry, 0) < MAX_STARTS:
+                start = entry
         if state == "orphaned" and recover is None:
             if mem_ok:
                 recover = entry
@@ -328,13 +338,14 @@ def decide(entries, claims, live, strikes, notified, now, mem_ok):
                                "is low on memory, so I'm waiting instead of "
                                "restarting it." % entry))
     return {"states": states, "alerts": alerts, "recover": recover,
-            "notified": new_notified}
+            "start": start, "notified": new_notified}
 
 
 def _alert_text(entry, state, strikes):
     if state == "unclaimed":
-        return ("%s is open in the ledger, but no session ever picked it up."
-                % entry)
+        return ("%s is open in the ledger and no session picked it up. I tried to start "
+                "one %d times and it never claimed the row, so it needs a look."
+                % (entry, MAX_STARTS))
     if state == "unknown":
         return ("I can't tell whether the session working on %s is still alive "
                 "— the check itself failed, so the session may be fine. Worth "
@@ -450,6 +461,77 @@ def build_prompt(claim, strikes):
     )
 
 
+def count_starts():
+    """How many times vigil has already tried to START each entry."""
+    counts = {}
+    try:
+        for ln in incidents_path().read_text().splitlines():
+            if "event=start" not in ln:
+                continue
+            for field in ln.split():
+                if field.startswith("entry="):
+                    key = field.split("=", 1)[1]
+                    counts[key] = counts.get(key, 0) + 1
+    except OSError:
+        pass
+    return counts
+
+
+def selected_start_vendor():
+    """Configured vendor for new, unclaimed work; invalid or absent is disabled."""
+    try:
+        vendor = (CONFIG / "start-vendor").read_text().strip()
+    except OSError:
+        return None
+    return vendor if vendor in ("claude", "codex") else None
+
+
+def start_argv(entry, workdir, vendor):
+    prompt = (
+        "vigil: ledger row %s is open and no session ever claimed it. Read it in the ledger, "
+        "claim it with `vigil claim %s --session <your-session-id> --vendor %s`, then do "
+        "the work. Reconcile observed state first (files, PRs, running units) — another "
+        "session may have done part of it without claiming. If the row turns out to be "
+        "already finished, close it with evidence instead of redoing it."
+        % (entry, entry, vendor))
+    if vendor == "codex":
+        inner = [CODEX_BIN, "-m", "gpt-5.6-sol", "-c",
+                 "model_reasoning_effort=high", "--sandbox", "danger-full-access",
+                 "-a", "never", prompt]
+    elif vendor == "claude":
+        inner = [CLAUDE_BIN, "--permission-mode", "default", prompt]
+    else:
+        raise ValueError("unsupported start vendor")
+    return [TMUX_BIN, "new-session", "-d", "-s", "vigil-start-%s" % entry,
+            "-c", workdir, "--"] + inner
+
+
+def start_work(entry, workdir, starts):
+    """Launch a session on a ledger row nobody ever claimed.
+
+    Distinct from recover(): there is no session to resume and no claim to read a vendor or
+    policy from, so this starts a fresh one and tells it to claim the row itself. Bounded by
+    MAX_STARTS so a row that never claims escalates to the owner instead of respawning hourly.
+    """
+    vendor = selected_start_vendor()
+    if vendor is None:
+        append_incident(event="fail", entry=entry,
+                        why="start_vendor_unconfigured")
+        return False
+    workdir = workdir or str(Path.home())
+    attempt = uuid.uuid4().hex[:12]
+    append_incident(event="start", attempt=attempt, entry=entry,
+                    n=starts.get(entry, 0) + 1, vendor=vendor)
+    argv = start_argv(entry, workdir, vendor)
+    try:
+        subprocess.run(argv, check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        append_incident(event="fail", attempt=attempt, entry=entry,
+                        why=str(exc)[:80].replace(" ", "_"))
+        return False
+    return True
+
+
 def recover(entry, claim, strikes):
     attempt = uuid.uuid4().hex[:12]
     append_incident(event="intent", attempt=attempt, entry=entry,
@@ -554,10 +636,12 @@ def cmd_check():
                 del notified[k]
         claims = load_claims()
         strikes, _ = parse_incidents()
+        starts = count_starts()
         entries = [e for e, _ in entries_src]
         workdirs = {e: s.get("workdir") for e, s in entries_src}
         live = {e: liveness(claims[e]) for e in entries if e in claims}
-        d = decide(entries, claims, live, strikes, notified, time.time(), mem_ok())
+        d = decide(entries, claims, live, strikes, notified, time.time(), mem_ok(),
+                   starts=starts)
         titles = {"unclaimed": "%s has no one on it",
                   "unknown": "Can't check on %s",
                   "quarantined": "%s needs you",
@@ -565,6 +649,8 @@ def cmd_check():
         for entry, state, msg in d["alerts"]:
             if state != "orphaned":  # recovery announces itself with ack inside recover()
                 alert(titles.get(state, "%s: " + state) % entry, msg)
+        if d["start"]:
+            start_work(d["start"], workdirs.get(d["start"]), starts)
         if d["recover"]:
             claim = dict(claims[d["recover"]])
             claim.setdefault("workdir", workdirs.get(d["recover"]))
@@ -762,6 +848,22 @@ def cmd_reset(argv):
     return 0
 
 
+def cmd_vendor(argv):
+    path = CONFIG / "start-vendor"
+    if not argv:
+        print(selected_start_vendor() or "unset")
+        return 0
+    if len(argv) != 1 or argv[0] not in ("claude", "codex"):
+        print("vigil: usage: vigil vendor [claude|codex]", file=sys.stderr)
+        return 2
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(argv[0] + "\n")
+    tmp.replace(path)
+    print("vigil: new unclaimed work will start with %s" % argv[0])
+    return 0
+
+
 def cmd_status():
     entries_src, errors = open_entries()
     claims = load_claims()
@@ -801,9 +903,11 @@ def main():
         return cmd_ask(rest)
     if cmd == "reset":
         return cmd_reset(rest)
+    if cmd == "vendor":
+        return cmd_vendor(rest)
     if cmd == "status":
         return cmd_status()
-    print("usage: vigil [check|selfcheck|claim|beat|blocked|ask|reset|status]", file=sys.stderr)
+    print("usage: vigil [check|selfcheck|claim|beat|blocked|ask|reset|vendor|status]", file=sys.stderr)
     return 2
 
 

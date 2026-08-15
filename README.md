@@ -16,6 +16,9 @@ One Python file, stdlib only. One hourly timer. No daemon.
   files and acts on the diff. Death requires the process generation AND the vendor
   signal (`claude agents --json` / codex proc scan) to agree; observation failure is
   UNKNOWN, which alerts and never resumes.
+- **Start**: unclaimed work uses the persisted vendor selected by `vigil vendor codex`
+  or `vigil vendor claude`. With no valid selection it fails closed. Codex starts as
+  Sol/high; recovery of claimed work always keeps that session's original vendor.
 - **Recover**: write-ahead intent → continuity preflight (transcript/thread must prove
   resumable) → alert (server-acked) → argv-vector launch in tmux → verify the new
   process → commit the new claim generation. A crashed recovery reconciles on the next
@@ -32,11 +35,11 @@ One Python file, stdlib only. One hourly timer. No daemon.
 
 ## Commands
 
-    vigil check | selfcheck | claim | beat | blocked | ask | reset | status
+    vigil check | selfcheck | claim | beat | blocked | ask | reset | vendor | status
 
 ## Enforcement
 
-21-test suite: effect-level kill-test against fake vendor binaries and a fake ntfy
+34-test suite: effect-level kill-test against fake vendor binaries and a fake ntfy
 server, crash injection at every intent/launch/commit boundary, lock contention,
 UNKNOWN-vs-DEAD separation. Mutation campaign on the pure decision core: 10/10 mutants
 caught. Live kill/resume verified against real Claude Code and Codex CLI sessions.
