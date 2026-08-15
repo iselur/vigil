@@ -20,6 +20,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 STATE = Path(os.environ.get("VIGIL_STATE", "~/.local/state/vigil")).expanduser()
@@ -140,6 +141,90 @@ def write_json(path, obj):
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=1, sort_keys=True))
     tmp.replace(p)
+
+
+def claim_lock_path(entry):
+    """Return Vigil's one stable private lock path for a validated entry."""
+    if not isinstance(entry, str) or not ENTRY_RE.fullmatch(entry):
+        raise ValueError("invalid entry id")
+    return STATE / "claim-locks" / (entry + ".lock")
+
+
+@contextmanager
+def entry_lock(entry):
+    """Serialize claim replacement and guarded consumers for one entry."""
+    path = claim_lock_path(entry)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def claim_path(entry):
+    if not isinstance(entry, str) or not ENTRY_RE.fullmatch(entry):
+        raise ValueError("invalid entry id")
+    return claims_dir() / (entry + ".json")
+
+
+def load_claim_strict(entry, session):
+    """Reload the current claim under the caller's already-held entry lock."""
+    if not isinstance(session, str) or not session.strip():
+        raise ValueError("invalid session")
+    path = claim_path(entry)
+    try:
+        claim = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("invalid claim") from exc
+    if not isinstance(claim, dict) or claim.get("entry") != entry:
+        raise ValueError("invalid claim")
+    claim_session = claim.get("session")
+    if not isinstance(claim_session, str) or not claim_session.strip():
+        raise ValueError("invalid claim session")
+    if claim_session != session:
+        raise ValueError("claim session mismatch")
+    if claim.get("vendor") not in ("claude", "codex"):
+        raise ValueError("invalid claim vendor")
+    if (not isinstance(claim.get("workdir"), str) or
+            not claim["workdir"].strip() or
+            isinstance(claim.get("generation"), bool) or
+            not isinstance(claim.get("generation"), int) or
+            claim["generation"] <= 0):
+        raise ValueError("invalid claim identity")
+    pid = claim.get("pid")
+    starttime = claim.get("starttime")
+    if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or
+            isinstance(starttime, bool) or not isinstance(starttime, int) or
+            starttime < 0 or proc_starttime(pid) != starttime):
+        raise ValueError("claim process generation mismatch")
+    return claim
+
+
+CLAIM_IDENTITY_FIELDS = ("entry", "session", "vendor", "pid", "starttime",
+                         "generation")
+
+
+def claim_identity_matches(left, right):
+    return (isinstance(left, dict) and isinstance(right, dict) and
+            all(left.get(key) == right.get(key)
+                for key in CLAIM_IDENTITY_FIELDS))
+
+
+def intent_identity_matches(claim, intent):
+    if not isinstance(claim, dict):
+        return False
+    if any(not intent.get(key) for key in CLAIM_IDENTITY_FIELDS):
+        return False
+    return all(str(claim.get(key)) == intent.get(key)
+               for key in CLAIM_IDENTITY_FIELDS)
 
 
 def claims_dir():
@@ -536,7 +621,8 @@ def recover(entry, claim, strikes):
     attempt = uuid.uuid4().hex[:12]
     append_incident(event="intent", attempt=attempt, entry=entry,
                     strikes=strikes.get(entry, 0) + 1, session=claim["session"],
-                    vendor=claim["vendor"])
+                    vendor=claim["vendor"], pid=claim["pid"],
+                    starttime=claim["starttime"], generation=claim["generation"])
     fault("post-intent")
     if not preflight(claim):
         append_incident(event="fail", attempt=attempt, entry=entry,
@@ -568,11 +654,17 @@ def recover(entry, claim, strikes):
                         note="verify:process-not-found")
         return False
     pid, st = found
-    newclaim = dict(claim, pid=pid, starttime=st,
-                    generation=claim.get("generation", 1) + 1,
-                    created=now_iso(), created_epoch=time.time())
     fault("pre-commit")
-    write_json(claims_dir() / ("%s.json" % entry), newclaim)
+    with entry_lock(entry):
+        current = read_json(claim_path(entry), None)
+        if not claim_identity_matches(current, claim):
+            append_incident(event="fail", attempt=attempt, entry=entry,
+                            note="commit:claim-changed")
+            return False
+        newclaim = dict(current, pid=pid, starttime=st,
+                        generation=current.get("generation", 1) + 1,
+                        created=now_iso(), created_epoch=time.time())
+        write_json(claim_path(entry), newclaim)
     append_incident(event="commit", attempt=attempt, entry=entry, pid=pid,
                     starttime=st, generation=newclaim["generation"])
     return True
@@ -583,20 +675,28 @@ def reconcile():
     _, dangling = parse_incidents()
     for kv in dangling:
         entry, attempt = kv.get("entry"), kv.get("attempt")
-        claims = load_claims()
-        claim = claims.get(entry)
-        found = find_resumed(claim, deadline_s=1) if claim else None
-        if found:
-            pid, st = found
-            newclaim = dict(claim, pid=pid, starttime=st,
-                            generation=claim.get("generation", 1) + 1,
-                            created=now_iso(), created_epoch=time.time())
-            write_json(claims_dir() / ("%s.json" % entry), newclaim)
-            append_incident(event="commit", attempt=attempt, entry=entry, pid=pid,
-                            starttime=st, note="reconciled")
-        else:
+        if not ENTRY_RE.fullmatch(entry or ""):
             append_incident(event="fail", attempt=attempt, entry=entry,
-                            note="reconciled:no-process")
+                            note="reconciled:invalid-entry")
+            continue
+        with entry_lock(entry):
+            claim = read_json(claim_path(entry), None)
+            if not intent_identity_matches(claim, kv):
+                append_incident(event="fail", attempt=attempt, entry=entry,
+                                note="reconciled:claim-identity-mismatch")
+                continue
+            found = find_resumed(claim, deadline_s=1) if claim else None
+            if found:
+                pid, st = found
+                newclaim = dict(claim, pid=pid, starttime=st,
+                                generation=claim.get("generation", 1) + 1,
+                                created=now_iso(), created_epoch=time.time())
+                write_json(claim_path(entry), newclaim)
+                append_incident(event="commit", attempt=attempt, entry=entry, pid=pid,
+                                starttime=st, note="reconciled")
+            else:
+                append_incident(event="fail", attempt=attempt, entry=entry,
+                                note="reconciled:no-process")
 
 
 # ---------- commands ----------
@@ -713,7 +813,18 @@ def cmd_selfcheck():
     return 0
 
 
-def _find_agent_pid():
+def _agent_vendor(argv):
+    if not argv or not argv[0]:
+        return None
+    base = os.path.basename(argv[0])
+    if base in ("claude", "claude.exe"):
+        return "claude"
+    if base in ("codex", "codex.exe"):
+        return "codex"
+    return None
+
+
+def _find_agent_process():
     pid = os.getppid()
     for _ in range(15):
         if pid <= 1:
@@ -723,16 +834,64 @@ def _find_agent_pid():
                 "utf-8", "replace").split("\0")
         except OSError:
             break
-        base = os.path.basename(argv[0]) if argv and argv[0] else ""
-        joined = " ".join(argv)
-        if "claude" in base or "codex" in base or "/claude" in joined or "codex" in joined:
-            return pid
+        vendor = _agent_vendor(argv)
+        if vendor:
+            return pid, proc_starttime(pid), vendor
         try:
             stat = Path("/proc/%d/stat" % pid).read_text()
             pid = int(stat.rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             break
     return None
+
+
+def _find_agent_pid():
+    found = _find_agent_process()
+    return found[0] if found else None
+
+
+def cmd_guard(argv):
+    """Run a consumer with the locked, current claim in VIGIL_CLAIM_JSON."""
+    import argparse
+    if "--" not in argv:
+        print("vigil: guard requires `-- <consumer argv>`", file=sys.stderr)
+        return 2
+    split = argv.index("--")
+    guard_argv, consumer = argv[:split], argv[split + 1:]
+    if not consumer:
+        print("vigil: guard requires a consumer command", file=sys.stderr)
+        return 2
+    ap = argparse.ArgumentParser(prog="vigil guard")
+    ap.add_argument("entry")
+    ap.add_argument("--session", required=True)
+    try:
+        args = ap.parse_args(guard_argv)
+    except SystemExit as exc:
+        return int(exc.code)
+    if not ENTRY_RE.fullmatch(args.entry):
+        print("vigil: invalid entry id", file=sys.stderr)
+        return 2
+    try:
+        with entry_lock(args.entry):
+            actor = _find_agent_process()
+            if actor is None:
+                raise ValueError("cannot locate Codex or Claude ancestor")
+            pid, starttime, vendor = actor
+            claim = load_claim_strict(args.entry, args.session)
+            if claim["vendor"] != vendor or claim["pid"] != pid or \
+                    claim["starttime"] != starttime:
+                raise ValueError("claim does not own invoking agent generation")
+            env = os.environ.copy()
+            env["VIGIL_CLAIM_JSON"] = json.dumps(
+                claim, sort_keys=True, separators=(",", ":"))
+            result = subprocess.run(consumer, env=env)
+    except (OSError, ValueError) as exc:
+        print("vigil: guard refused — %s" % exc, file=sys.stderr)
+        return 2
+    if result.returncode < 0:
+        os.kill(os.getpid(), -result.returncode)
+        return 128 + (-result.returncode)
+    return result.returncode
 
 
 def cmd_claim(argv):
@@ -746,8 +905,14 @@ def cmd_claim(argv):
     ap.add_argument("--policy", action="append", default=[],
                     help="k=v, e.g. permission-mode=bypassPermissions")
     a = ap.parse_args(argv)
-    if not ENTRY_RE.match(a.entry):
+    if not ENTRY_RE.fullmatch(a.entry):
         print("vigil: invalid entry id", file=sys.stderr)
+        return 2
+    if not a.session.strip():
+        print("vigil: invalid session", file=sys.stderr)
+        return 2
+    if a.workdir is not None and not a.workdir.strip():
+        print("vigil: invalid workdir", file=sys.stderr)
         return 2
     pid = a.pid or _find_agent_pid()
     if pid is None:
@@ -757,14 +922,15 @@ def cmd_claim(argv):
     if st is None:
         print("vigil: pid %d not alive" % pid, file=sys.stderr)
         return 2
-    old = read_json(claims_dir() / ("%s.json" % a.entry), {})
-    claim = {"entry": a.entry, "session": a.session, "vendor": a.vendor,
-             "pid": pid, "starttime": st,
-             "generation": old.get("generation", 0) + 1,
-             "policy": dict(kv.split("=", 1) for kv in a.policy if "=" in kv),
-             "workdir": a.workdir or os.getcwd(),
-             "created": now_iso(), "created_epoch": time.time()}
-    write_json(claims_dir() / ("%s.json" % a.entry), claim)
+    with entry_lock(a.entry):
+        old = read_json(claim_path(a.entry), {})
+        claim = {"entry": a.entry, "session": a.session, "vendor": a.vendor,
+                 "pid": pid, "starttime": st,
+                 "generation": old.get("generation", 0) + 1,
+                 "policy": dict(kv.split("=", 1) for kv in a.policy if "=" in kv),
+                 "workdir": a.workdir or os.getcwd(),
+                 "created": now_iso(), "created_epoch": time.time()}
+        write_json(claim_path(a.entry), claim)
     print("vigil: claimed %s (pid %d gen %d)" % (a.entry, pid, claim["generation"]))
     return 0
 
@@ -788,27 +954,33 @@ def cmd_blocked(argv):
     ap.add_argument("--by", default="", help="deadline, e.g. 18:00 or 2026-08-09T18:00")
     ap.add_argument("--clear", action="store_true")
     a = ap.parse_args(argv)
-    path = claims_dir() / ("%s.json" % a.entry)
-    claim = read_json(path, None)
-    if not ENTRY_RE.match(a.entry) or claim is None:
+    if not ENTRY_RE.fullmatch(a.entry):
         print("vigil: no claim for %r — claim it first" % a.entry, file=sys.stderr)
         return 2
+    path = claim_path(a.entry)
+    with entry_lock(a.entry):
+        claim = read_json(path, None)
+        if claim is None:
+            print("vigil: no claim for %r — claim it first" % a.entry, file=sys.stderr)
+            return 2
+        if a.clear:
+            claim.pop("blocked", None)
+            write_json(path, claim)
+        elif not a.ask:
+            print("vigil: an ask is required (what decision do you need?)",
+                  file=sys.stderr)
+            return 2
+        else:
+            claim["blocked"] = {"ask": a.ask, "recommend": a.recommend, "by": a.by,
+                                "created": now_iso()}
+            write_json(path, claim)
     notified = read_json(STATE / "notified.json", {})
     if a.clear:
-        claim.pop("blocked", None)
-        write_json(path, claim)
         notified.pop(a.entry, None)
         write_json(STATE / "notified.json", notified)
         append_incident(event="unblocked", entry=a.entry)
         print("vigil: %s unblocked" % a.entry)
         return 0
-    if not a.ask:
-        print("vigil: an ask is required (what decision do you need?)",
-              file=sys.stderr)
-        return 2
-    claim["blocked"] = {"ask": a.ask, "recommend": a.recommend, "by": a.by,
-                        "created": now_iso()}
-    write_json(path, claim)
     append_incident(event="blocked", entry=a.entry)
     body = "%s is blocked on you: %s" % (a.entry, a.ask)
     if a.recommend:
@@ -895,6 +1067,8 @@ def main():
         return cmd_selfcheck()
     if cmd == "claim":
         return cmd_claim(rest)
+    if cmd == "guard":
+        return cmd_guard(rest)
     if cmd == "beat":
         return cmd_beat(rest)
     if cmd == "blocked":
@@ -907,7 +1081,7 @@ def main():
         return cmd_vendor(rest)
     if cmd == "status":
         return cmd_status()
-    print("usage: vigil [check|selfcheck|claim|beat|blocked|ask|reset|vendor|status]", file=sys.stderr)
+    print("usage: vigil [check|selfcheck|claim|guard|beat|blocked|ask|reset|vendor|status]", file=sys.stderr)
     return 2
 
 
